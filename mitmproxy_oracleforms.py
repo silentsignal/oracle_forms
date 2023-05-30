@@ -106,6 +106,9 @@ class OracleForms:
             if len(flow.request.content)==0:
                 ctx.log("[!] Empty message")
                 return
+            if flow.request.content == b"NULLPOST":
+                ctx.log("[*] Ignoring NULLPOST")
+                return
             if not flow.request.content.endswith(b"\xf0\x01"):
                 ctx.log("[!] Invalid request message?")
             with self.req_lock:
