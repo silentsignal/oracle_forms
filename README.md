@@ -40,13 +40,13 @@ Now you can start your Oracle Forms application, configured to use Burp as its p
 
 ### Building the Extension
 
-Download the `frmall.jar` archive from your target and copy it under `OracleFormsSerializer/lib`. Inside `OracleFormsSerializer/` start an Ant build:
+Download the `frmall.jar` archive from your target and copy it under `OracleFormsSerializer/lib`. Inside `OracleFormsSerializer/` start an Gradle build:
 
 ```
-$ ant build
+$ ./gradlew shadowJar
 ```
 
-You should find `OracleFormsSerializer.jar` under `bin/`.
+You should find `OracleFormsSerializer-<SOMEVERSION>-all.jar` under `build/libs/`.
 
 ### Options
 

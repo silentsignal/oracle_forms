@@ -1,0 +1,37 @@
+buildscript {
+    repositories {
+        mavenCentral()
+        gradlePluginPortal()
+    }
+    dependencies {
+        classpath "gradle.plugin.com.github.johnrengelman:shadow:7.1.2"
+    }
+}
+
+plugins {
+    //id 'java-library'
+    id 'java'
+}
+
+repositories {
+    mavenLocal()
+ 
+    maven {
+        url = uri('https://repo.maven.apache.org/maven2/')
+    }
+}
+
+dependencies {
+    implementation 'javax.json.bind:javax.json.bind-api:1.0'
+    implementation 'org.eclipse:yasson:1.0'
+    implementation files('lib/frmall.jar')
+}
+
+group = 'burp'
+version = '1.0-SNAPSHOT'
+description = 'OracleFormsSerializer'
+java.sourceCompatibility = JavaVersion.VERSION_1_8
+
+
+apply plugin: 'com.github.johnrengelman.shadow'
+
