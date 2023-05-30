@@ -260,14 +260,17 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         {
 
             PrintWriter stdout = new PrintWriter(callbacks.getStdout(), true);
+            stdout.println("[*] Setting message from dummy POST");
 
             IRequestInfo dummyRequest=helpers.analyzeRequest(txtInput.getText());
             HashMap<String,String> paramStrings=new HashMap<String,String>(); // Not necessarily optimal, but code is nicer...
             HashMap<String,Integer> paramInts=new HashMap<String,Integer>(); 
             for (IParameter p: dummyRequest.getParameters()){
                 if (p.getName().startsWith("string_")){
+                    stdout.println("[+] Found string parameter: "+p.getName()+"="+p.getValue().toString());
                     paramStrings.put(p.getName(), helpers.urlDecode(p.getValue()));
                 }else if(p.getName().startsWith("int_")){
+                    stdout.println("[+] Found int parameter: "+p.getName()+"="+p.getValue().toString());
                     paramInts.put(p.getName(), Integer.parseInt(p.getValue()));
                 }
             }
@@ -282,16 +285,22 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             DataOutputStream dos=new DataOutputStream(baos);
             Message m;
             try{
+                stdout.println("[*] Enter stream parser");
                 while((m=Message.readDetails(dis,as))!=null){
+                    stdout.println("[*] Message start, ID: "+m_id+ " size: "+m.size());
                     for (int i=0;i<m.size();i++){
-                        if (m.getPropertyTypeAt(i)==1){
+                        stdout.println("[*] Property type at "+i+" is "+m.getPropertyTypeAt(i));
+                        if (m.getPropertyTypeAt(i) == 1){
                             String stringKey=String.format("string_%d_%d",m_id,i);
-                            String intKey=String.format("int_%d_%d",m_id,i);
                             if (paramStrings.containsKey(stringKey)){
-                                stdout.println("Setting String value for "+stringKey);
+                                stdout.println("[+] Setting String value for "+stringKey);
                                 m.setValueAt(i, paramStrings.get(stringKey));
-                            }else if (paramInts.containsKey(intKey)){
-                                stdout.println("Setting Integer value for "+intKey);
+                            }
+                        }
+                        else if (m.getPropertyTypeAt(i) == 3){
+                            String intKey=String.format("int_%d_%d",m_id,i);
+                            if (paramInts.containsKey(intKey)){
+                                stdout.println("[+] Setting Integer value for "+intKey);
                                 m.setValueAt(i, paramInts.get(intKey));
                             }
                         }
