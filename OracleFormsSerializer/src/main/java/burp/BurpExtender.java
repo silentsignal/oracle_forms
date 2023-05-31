@@ -200,7 +200,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             DataInputStream dis=new DataInputStream(bis);
             PrintWriter stdout = new PrintWriter(callbacks.getStdout(), true);
             Message m;
-            if(!isRequest){
+            if(true){
                 Gson gson = new Gson();
                 ArrayList<OFSMessage> messages=new ArrayList<OFSMessage>();
                 try{
@@ -270,20 +270,9 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         {
 
             PrintWriter stdout = new PrintWriter(callbacks.getStdout(), true);
-            stdout.println("[*] Setting message from dummy POST");
-
-            IRequestInfo dummyRequest=helpers.analyzeRequest(txtInput.getText());
-            HashMap<String,String> paramStrings=new HashMap<String,String>(); // Not necessarily optimal, but code is nicer...
-            HashMap<String,Integer> paramInts=new HashMap<String,Integer>(); 
-            for (IParameter p: dummyRequest.getParameters()){
-                if (p.getName().startsWith("string_")){
-                    stdout.println("[+] Found string parameter: "+p.getName()+"="+p.getValue().toString());
-                    paramStrings.put(p.getName(), helpers.urlDecode(p.getValue()));
-                }else if(p.getName().startsWith("int_")){
-                    stdout.println("[+] Found int parameter: "+p.getName()+"="+p.getValue().toString());
-                    paramInts.put(p.getName(), Integer.parseInt(p.getValue()));
-                }
-            }
+            stdout.println("[*] Setting message from JSON");
+            Gson gson = new Gson();
+            OFSMessage[] ofsMessages = gson.fromJson(helpers.bytesToString(txtInput.getText()) , OFSMessage[].class);
 
             IRequestInfo rInfo=helpers.analyzeRequest(currentMessage);
             byte[] body=Arrays.copyOfRange(currentMessage, rInfo.getBodyOffset(), currentMessage.length);
@@ -301,19 +290,24 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     for (int i=0;i<m.size();i++){
                         stdout.println("[*] Property type at "+i+" is "+m.getPropertyTypeAt(i));
                         if (m.getPropertyTypeAt(i) == 1){
-                            String stringKey=String.format("string_%d_%d",m_id,i);
-                            if (paramStrings.containsKey(stringKey)){
-                                stdout.println("[+] Setting String value for "+stringKey);
-                                m.setValueAt(i, paramStrings.get(stringKey));
+                            if (ofsMessages[m_id].stringProperties[i] != null){
+                                stdout.println("  [+] Setting String value for "+m_id+"/"+i);
+                                m.setValueAt(i, ofsMessages[m_id].stringProperties[i]);
                             }
                         }
                         else if (m.getPropertyTypeAt(i) == 3){
-                            String intKey=String.format("int_%d_%d",m_id,i);
-                            if (paramInts.containsKey(intKey)){
-                                stdout.println("[+] Setting Integer value for "+intKey);
-                                m.setValueAt(i, paramInts.get(intKey));
+                            if (ofsMessages[m_id].intProperties[i] != null){
+                                stdout.println("  [+] Setting Integer value for "+m_id+"/"+i);
+                                m.setValueAt(i, ofsMessages[m_id].intProperties[i]);
                             }
                         }
+                        else if (m.getPropertyTypeAt(i) == 13){
+                            if (ofsMessages[m_id].booleanProperties[i] != null){
+                                stdout.println("  [+] Setting Boolean value for "+m_id+"/"+i);
+                                m.setValueAt(i, ofsMessages[m_id].booleanProperties[i]);
+                            }
+                        }
+                        // TODO Handle recursive Messages
                     }
                     m.writeDetails(new FormsDispatcher(), dos);
                     m_id++;

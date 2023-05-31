@@ -6,10 +6,10 @@ import java.io.PrintWriter;
 import java.util.ArrayList;
 
 public class OFSMessage {
-    private Integer[] intProperties;
-    private String[] stringProperties;
-    private Boolean[] booleanProperties;
-    private OFSMessage[] messageProperties;
+    public Integer[] intProperties;
+    public String[] stringProperties;
+    public Boolean[] booleanProperties;
+    public OFSMessage[] messageProperties;
     private OFSMessage(Integer[] intp, String[] stringp, Boolean[] boolp, OFSMessage[] msgp){
         intProperties=intp;
         stringProperties=stringp;
