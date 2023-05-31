@@ -48,6 +48,26 @@ $ ./gradlew shadowJar
 
 You should find `OracleFormsSerializer-<SOMEVERSION>-all.jar` under `build/libs/`.
 
+### Message Editing
+
+The extension implements partial (de)serialization of Oracle Forms Message streams, making the messages human partially readable and editable on the Oracle Forms message viewer tab provided by the Burp extension. 
+
+A Message stream is an ordered list of Message objects, and Message objects objects consist of an ordered list of Properties. This means that we can associate the human readable representation of messages with Oracle's true form by keeping track of Messages and Properties by their positions either in the Message stream or inside a Message.
+
+Supported operations:
+* Editing property values of the following types:
+  * Strings
+  * Integers
+  * Booleans
+
+Definitely *not* supported (yet):
+* Insert/delete/reorder Messages or Properties
+* Setting a Property to a different type
+* Setting a Property to `null`
+* Editing nested Messages
+* If a Message stream is split across multiple HTTP messages, we can't reconstruct a modified stream. In such cases editing is not supported, and editing is disabled on the Oracle Forms tab. 
+
+
 ### Options
 
 #### Response timeout
