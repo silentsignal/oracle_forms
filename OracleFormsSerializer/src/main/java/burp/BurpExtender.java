@@ -16,6 +16,7 @@ import java.io.*;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 
+import com.google.gson.Gson;
 import oracle.forms.engine.FormsDispatcher;
 import oracle.forms.engine.FormsMessage;
 import oracle.forms.engine.Message;
@@ -200,24 +201,33 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             PrintWriter stdout = new PrintWriter(callbacks.getStdout(), true);
             Message m;
             if(!isRequest){
+                Gson gson = new Gson();
+                ArrayList<OFSMessage> messages=new ArrayList<OFSMessage>();
                 try{
-                    StringBuilder sb=new StringBuilder();
-                    
+                    //StringBuilder sb=new StringBuilder();
+
                     while((m=Message.readDetails(dis,as))!=null){
-                        sb.append(messageToString(m));
-                        sb.append("\n+++ Message +++\n");
+                        /*sb.append(messageToString(m));
+                        sb.append("\n+++ Message +++\n");*/
+                        messages.add(OFSMessage.createOFSMessage(m, callbacks));
                     }
-                    txtInput.setText(sb.toString().getBytes());
-                    txtInput.setEditable(false);
+                    txtInput.setEditable(true);
                 }catch(EOFException eofe){
                     stdout.println("\nReached EOFin setMessage()");
+                    txtInput.setEditable(false); // If the stream can't fit into a single HTTP message we can't edit :(
                 }catch(IOException e){
                     stdout.println("Message IOException");
+                    txtInput.setEditable(false);
                     e.printStackTrace(stdout);
                 }catch(IllegalArgumentException iae){
                     stdout.println("Message response IllegalArgumentException");
+                    txtInput.setEditable(false);
                     iae.printStackTrace(stdout);
                 }
+                OFSMessage[] msgArr=new OFSMessage[messages.size()];
+                //stdout.println("JSON: "+gson.toJson(messages.toArray(msgArr)));
+                txtInput.setText(gson.toJson(messages.toArray(msgArr)).getBytes());
+
             }else
             {
                 byte[] dummyRequest=helpers.buildHttpRequest(rInfo.getUrl()); // [TODO] POST plz

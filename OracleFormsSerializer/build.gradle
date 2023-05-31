@@ -22,8 +22,10 @@ repositories {
 }
 
 dependencies {
-    implementation 'javax.json.bind:javax.json.bind-api:1.0'
-    implementation 'org.eclipse:yasson:1.0'
+    //implementation 'javax.json.bind:javax.json.bind-api:1.0'
+    //implementation 'org.eclipse:yasson:1.0'
+    implementation 'com.google.code.gson:gson:2.10.1'
+
     implementation files('lib/frmall.jar')
 }
 
