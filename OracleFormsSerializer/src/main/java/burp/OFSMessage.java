@@ -26,17 +26,17 @@ public class OFSMessage {
         for (int i=0;i<msg.size();i++){
             int type = msg.getPropertyTypeAt(i);
             stdout.println("  [*] Property "+i+": "+msg.getValueAt(i)+" Type: "+type+"\n");
-            if (type == 3){
+            if (type == 3 && msg.getValueAt(i) instanceof Integer){
                 intarr.add((Integer)msg.getValueAt(i));
             }else{
                 intarr.add(null);
             }
-            if (type == 1){
+            if (type == 1&& msg.getValueAt(i) instanceof String){
                 strarr.add(msg.getValueAt(i).toString());
             }else{
                 strarr.add(null);
             }
-            if (type == 13){
+            if (type == 13 && msg.getValueAt(i) instanceof Boolean){
                 if (msg.getValueAt(i).toString() == "true"){
                     boolarr.add(Boolean.TRUE);
                 }else{

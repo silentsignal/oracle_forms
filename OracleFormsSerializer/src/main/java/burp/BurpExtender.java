@@ -275,50 +275,61 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             Gson gson = new Gson();
             OFSMessage[] ofsMessages = gson.fromJson(helpers.bytesToString(txtInput.getText()) , OFSMessage[].class);
 
-            IRequestInfo rInfo=helpers.analyzeRequest(currentMessage);
-            byte[] body=Arrays.copyOfRange(currentMessage, rInfo.getBodyOffset(), currentMessage.length);
-            String[] as=new String[256];
-            ByteArrayInputStream bis=new ByteArrayInputStream(body);
-            DataInputStream dis=new DataInputStream(bis);
-            int m_id=0;
-            ByteArrayOutputStream baos=new ByteArrayOutputStream();
-            DataOutputStream dos=new DataOutputStream(baos);
+            IRequestInfo rInfo = helpers.analyzeRequest(currentMessage);
+            byte[] body = Arrays.copyOfRange(currentMessage, rInfo.getBodyOffset(), currentMessage.length);
+            String[] as = new String[256];
+            ByteArrayInputStream bis = new ByteArrayInputStream(body);
+            DataInputStream dis = new DataInputStream(bis);
+            int m_id = 0;
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            DataOutputStream dos = new DataOutputStream(baos);
             Message m;
             try{
                 stdout.println("[*] Enter stream parser");
                 while((m=Message.readDetails(dis,as))!=null){
+                    if (m.getActionCode() == 5 || m.getActionCode() == 6){
+                        stdout.println("[!] Encountered delta message, no updates to be made");
+                        return currentMessage;
+                    }
                     stdout.println("[*] Message start, ID: "+m_id+ " size: "+m.size());
                     for (int i=0;i<m.size();i++){
                         stdout.println("[*] Property type at "+i+" is "+m.getPropertyTypeAt(i));
-                        if (m.getPropertyTypeAt(i) == 1){
+                        if (m.getPropertyTypeAt(i) == 1 && m.getValueAt(i) != null){
                             if (ofsMessages[m_id].stringProperties[i] != null){
-                                stdout.println("  [+] Setting String value for "+m_id+"/"+i);
-                                m.setValueAt(i, ofsMessages[m_id].stringProperties[i]);
+                                m.setValueAt(i, ofsMessages[m_id].stringProperties[i].toString());
+                                stdout.println("  [+] Set String value for "+m_id+"/"+i+" to "+m.getValueAt(i).toString());
                             }
                         }
-                        else if (m.getPropertyTypeAt(i) == 3){
+                        else if (m.getPropertyTypeAt(i) == 3 && m.getValueAt(i) != null){
                             if (ofsMessages[m_id].intProperties[i] != null){
-                                stdout.println("  [+] Setting Integer value for "+m_id+"/"+i);
                                 m.setValueAt(i, ofsMessages[m_id].intProperties[i]);
+                                stdout.println("  [+] Set Boolean value for "+m_id+"/"+i+" to "+m.getValueAt(i).toString());
                             }
                         }
-                        else if (m.getPropertyTypeAt(i) == 13){
+                        else if (m.getPropertyTypeAt(i) == 13 && m.getValueAt(i) != null){
                             if (ofsMessages[m_id].booleanProperties[i] != null){
-                                stdout.println("  [+] Setting Boolean value for "+m_id+"/"+i);
                                 m.setValueAt(i, ofsMessages[m_id].booleanProperties[i]);
+                                stdout.println("  [+] Set Boolean value for "+m_id+"/"+i+" to "+m.getValueAt(i).toString());
                             }
                         }
                         // TODO Handle recursive Messages
                     }
                     m.writeDetails(new FormsDispatcher(), dos);
                     m_id++;
+
                 }
                 
             }catch(EOFException eofe){
                 stdout.println("\nReached EOF in getMessage()");
+                return currentMessage;
             }catch(IOException e){
                 stdout.println("Message IOException");
                 e.printStackTrace(stdout);
+                return currentMessage;
+            }catch(IllegalArgumentException iae){
+                iae.printStackTrace(stdout);
+                stdout.println("[!] IllegalArgumentException thrown when serializing Message #"+m_id);
+                return currentMessage;
             }
             try{
                 dos.writeByte(-16);
@@ -327,7 +338,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             }catch(IOException e){
                 stdout.println("Message IOException - last bytes");
                 e.printStackTrace(stdout);
-                return null;
+                return currentMessage;
             }
         }
 
