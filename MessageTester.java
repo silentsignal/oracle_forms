@@ -2,6 +2,7 @@ import java.io.*;
 import oracle.forms.engine.FormsMessage;
 import oracle.forms.engine.Message;
 import oracle.forms.engine.FormsDispatcher;
+import java.nio.file.*;
 
 class MessageTester{
 
@@ -16,8 +17,8 @@ class MessageTester{
         return data;
     }
     private static void printMessage(Message m){
-        if (m.isDeltaMessage()){
-            System.out.println("Delta message, Delta Index: "+m.getDeltaIndex());    
+        if (m.getActionCode()==5 || m.getActionCode()==6){
+            System.out.println("Delta message");    
         }
         
         for (int i=0;i<m.size();i++){
@@ -40,11 +41,15 @@ class MessageTester{
         }
     }
 
-    public static void main(String argv[]){
-    	String bodyHex=argv[0];
+    public static void main(String argv[]) throws IOException{
+    	Path path = Paths.get(argv[0]);
+
+        byte[] body = Files.readAllBytes(path);
+        String[] as=new String[256];
+        /*String bodyHex=argv[0];
     	String[] as=new String[256];
         System.out.println(bodyHex);
-        byte[] body=hexStringToByteArray(bodyHex);
+        byte[] body=hexStringToByteArray(bodyHex);*/
         System.out.println("Body: "+body.length+" byte(s)");
         if (body.length==0) return;
         try{
