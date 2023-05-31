@@ -17,6 +17,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import oracle.forms.engine.FormsDispatcher;
 import oracle.forms.engine.FormsMessage;
 import oracle.forms.engine.Message;
@@ -201,7 +202,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             PrintWriter stdout = new PrintWriter(callbacks.getStdout(), true);
             Message m;
             if(true){
-                Gson gson = new Gson();
+                Gson gson = new GsonBuilder().setPrettyPrinting().create();
                 ArrayList<OFSMessage> messages=new ArrayList<OFSMessage>();
                 try{
                     //StringBuilder sb=new StringBuilder();
