@@ -66,6 +66,7 @@ Definitely *not* supported (yet):
 * Setting a Property to `null`
 * Editing nested Messages
 * If a Message stream is split across multiple HTTP messages, we can't reconstruct a modified stream. In such cases editing is not supported, and editing is disabled on the Oracle Forms tab. 
+* Editing Delta Messages
 
 
 ### Options
