@@ -211,6 +211,10 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                         /*sb.append(messageToString(m));
                         sb.append("\n+++ Message +++\n");*/
                         messages.add(OFSMessage.createOFSMessage(m, callbacks));
+                        if(m.getActionCode() == 5 || m.getActionCode() == 6){
+                            txtInput.setEditable(false);
+                            stdout.println("[!] Delta message, editing disabled");
+                        }
                     }
                     txtInput.setEditable(true);
                 }catch(EOFException eofe){
