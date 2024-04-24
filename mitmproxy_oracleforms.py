@@ -145,7 +145,7 @@ class OracleForms:
 
             ctx.log("RC4 initialized with key: %s" % (repr(self.key)))
             if ctx.options.corrupt_handshake:
-                flow.response.replace("Mate", "Matf")
+                flow.response.content = flow.response.content.replace(b'Mate', b'Matf')
             return
         if b"ifError:11/" in flow.response.content:
             with self.resp_lock:
