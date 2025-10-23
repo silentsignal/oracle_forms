@@ -29,8 +29,9 @@ Eliminating cryptography from the client is done by corrupting the handshake (hu
 
 (Originally the tools worked with a patched version of the `frmall.jar` client library. If for any reason the current method stops working, the original approach can be followed as described [here](JARPATCH.md).)
 
-Start mitmproxy with the provided script:
+Install dependencies and start mitmproxy with the provided script:
 ```
+pip install -r requirements.txt
 mitmdump -s mitmproxy_oracleforms.py -p 8081 
 ```
 
@@ -66,7 +67,7 @@ See [JARPATCH.md](JARPATCH.md)
 
 ### mitmproxy support
 
-The script was upgraded to support mitmproxy 4 (tested with 4.0.3), should also work with version 3.
+The script was upgraded to support mitmproxy 12 (tested with 12.1.1).
 
 Scanner Configuration
 ---------------------
