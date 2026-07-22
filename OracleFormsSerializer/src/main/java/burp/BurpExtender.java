@@ -75,6 +75,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         
         //callbacks.registerProxyListener(this);
         callbacks.registerMessageEditorTabFactory(this);
+        callbacks.registerMessageEditorTabFactory(new OracleFormsTreeTabFactory()); // read-only structured tree view
         callbacks.registerScannerInsertionPointProvider(this);
         callbacks.registerHttpListener(this);
 
@@ -1357,6 +1358,174 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     fireTableRowsUpdated(r, r);
                 }
             }
+        }
+    }
+
+    // Factory for the read-only structured tree view tab.
+    class OracleFormsTreeTabFactory implements IMessageEditorTabFactory {
+        @Override
+        public IMessageEditorTab createNewInstance(IMessageEditorController controller, boolean editable){
+            return new OracleFormsTreeTab();
+        }
+    }
+
+    // A read-only message-editor tab that renders the deserialized Forms message
+    // as a JTree (messages -> properties -> nested messages), with a filter box
+    // and a right-click "show raw hex". Recon aid for spotting object/menu IDs
+    // and hidden items. Never modifies the message.
+    class OracleFormsTreeTab implements IMessageEditorTab {
+        private final javax.swing.JPanel component;
+        private final javax.swing.JTree tree;
+        private final javax.swing.JTextField filterField;
+        private byte[] currentMessage;
+        private byte[] currentBody;
+        private boolean currentIsRequest=true;
+
+        OracleFormsTreeTab(){
+            component=new javax.swing.JPanel(new java.awt.BorderLayout());
+
+            filterField=new javax.swing.JTextField();
+            javax.swing.JPanel top=new javax.swing.JPanel(new java.awt.BorderLayout());
+            top.add(new javax.swing.JLabel(" Filter: "), java.awt.BorderLayout.WEST);
+            top.add(filterField, java.awt.BorderLayout.CENTER);
+            component.add(top, java.awt.BorderLayout.NORTH);
+
+            tree=new javax.swing.JTree(new javax.swing.tree.DefaultMutableTreeNode("No message"));
+            component.add(new javax.swing.JScrollPane(tree), java.awt.BorderLayout.CENTER);
+
+            filterField.getDocument().addDocumentListener(new javax.swing.event.DocumentListener(){
+                public void insertUpdate(javax.swing.event.DocumentEvent e){ rebuild(); }
+                public void removeUpdate(javax.swing.event.DocumentEvent e){ rebuild(); }
+                public void changedUpdate(javax.swing.event.DocumentEvent e){ rebuild(); }
+            });
+
+            final javax.swing.JPopupMenu menu=new javax.swing.JPopupMenu();
+            javax.swing.JMenuItem copyItem=new javax.swing.JMenuItem("Copy node text");
+            javax.swing.JMenuItem hexItem=new javax.swing.JMenuItem("Show raw hex of body");
+            menu.add(copyItem);
+            menu.add(hexItem);
+            copyItem.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){
+                    Object sel=tree.getLastSelectedPathComponent();
+                    if (sel!=null){
+                        java.awt.Toolkit.getDefaultToolkit().getSystemClipboard()
+                            .setContents(new java.awt.datatransfer.StringSelection(sel.toString()), null);
+                    }
+                }
+            });
+            hexItem.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){
+                    String hex=currentBody==null ? "" : byteArrayToHex(currentBody);
+                    javax.swing.JTextArea ta=new javax.swing.JTextArea(hex, 12, 64);
+                    ta.setLineWrap(true);
+                    ta.setEditable(false);
+                    javax.swing.JOptionPane.showMessageDialog(component, new javax.swing.JScrollPane(ta),
+                            "Raw Forms body hex", javax.swing.JOptionPane.PLAIN_MESSAGE);
+                }
+            });
+            tree.setComponentPopupMenu(menu);
+
+            callbacks.customizeUiComponent(component);
+        }
+
+        @Override
+        public String getTabCaption(){ return "Oracle Forms Tree"; }
+        @Override
+        public java.awt.Component getUiComponent(){ return component; }
+        @Override
+        public boolean isEnabled(byte[] content, boolean isRequest){ return true; }
+        @Override
+        public boolean isModified(){ return false; }
+        @Override
+        public byte[] getSelectedData(){ return null; }
+        @Override
+        public byte[] getMessage(){ return currentMessage; } // read-only
+
+        @Override
+        public void setMessage(byte[] content, boolean isRequest){
+            currentMessage=content;
+            currentIsRequest=isRequest;
+            if (content==null){
+                currentBody=null;
+                tree.setModel(new javax.swing.tree.DefaultTreeModel(new javax.swing.tree.DefaultMutableTreeNode("No message")));
+                return;
+            }
+            int bodyOffset;
+            if (isRequest){
+                bodyOffset=helpers.analyzeRequest(helpers.buildHttpService("dummyhost",1234,false),content).getBodyOffset();
+            }else{
+                bodyOffset=helpers.analyzeResponse(content).getBodyOffset();
+            }
+            currentBody=Arrays.copyOfRange(content, bodyOffset, content.length);
+            rebuild();
+        }
+
+        private void rebuild(){
+            javax.swing.tree.DefaultMutableTreeNode root=
+                new javax.swing.tree.DefaultMutableTreeNode("Oracle Forms "+(currentIsRequest?"request":"response"));
+            if (currentBody!=null){
+                try{
+                    String[] as=new String[256];
+                    ByteArrayInputStream bis=new ByteArrayInputStream(currentBody);
+                    DataInputStream dis=new DataInputStream(bis);
+                    Message m;
+                    int idx=0;
+                    while((m=Message.readDetails(dis,as))!=null){
+                        root.add(buildMessageNode(m, "Message "+idx+" (size "+m.size()+")"));
+                        idx++;
+                    }
+                }catch(EOFException eofe){
+                    // normal end of stream
+                }catch(Exception ex){
+                    root.add(new javax.swing.tree.DefaultMutableTreeNode("[parse error: "+ex+"]"));
+                }
+            }
+            String f=filterField.getText().trim().toLowerCase();
+            if (!f.isEmpty()){
+                filterTree(root, f);
+            }
+            tree.setModel(new javax.swing.tree.DefaultTreeModel(root));
+            for (int i=0;i<tree.getRowCount();i++){
+                tree.expandRow(i);
+            }
+        }
+
+        private javax.swing.tree.DefaultMutableTreeNode buildMessageNode(Message m, String label){
+            javax.swing.tree.DefaultMutableTreeNode node=new javax.swing.tree.DefaultMutableTreeNode(label);
+            for (int i=0;i<m.size();i++){
+                Object v=m.getValueAt(i);
+                int t=m.getPropertyTypeAt(i);
+                Object propId=m.getPropertyAt(i);
+                if (v instanceof Message){
+                    node.add(buildMessageNode((Message)v, "Property "+i+" [id="+propId+"] (nested message)"));
+                }else{
+                    String tlabel=(t==1?"String":(t==3?"Integer":"type"+t));
+                    String prefix=(t==3?"[int] ":"");
+                    String val=(v==null?"null":v.toString());
+                    node.add(new javax.swing.tree.DefaultMutableTreeNode(
+                        prefix+"Property "+i+" [id="+propId+"] "+tlabel+": "+val));
+                }
+            }
+            return node;
+        }
+
+        // Prune the tree to nodes whose label (or a descendant's) contains the
+        // filter. Returns true if the node was kept.
+        private boolean filterTree(javax.swing.tree.DefaultMutableTreeNode node, String filterLower){
+            boolean selfMatch=node.toString().toLowerCase().contains(filterLower);
+            java.util.List<javax.swing.tree.DefaultMutableTreeNode> children=new ArrayList<javax.swing.tree.DefaultMutableTreeNode>();
+            for (int i=0;i<node.getChildCount();i++){
+                children.add((javax.swing.tree.DefaultMutableTreeNode)node.getChildAt(i));
+            }
+            boolean anyChildKept=false;
+            for (javax.swing.tree.DefaultMutableTreeNode c: children){
+                if (filterTree(c, filterLower)){
+                    anyChildKept=true;
+                }else{
+                    node.remove(c);
+                }
+            }
+            return selfMatch || anyChildKept;
         }
     }
 }
