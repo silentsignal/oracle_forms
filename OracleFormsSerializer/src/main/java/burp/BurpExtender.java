@@ -410,15 +410,39 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
 
             IRequestInfo dummyRequest=helpers.analyzeRequest(txtInput.getText());
             HashMap<String,String> paramStrings=new HashMap<String,String>(); // Not necessarily optimal, but code is nicer...
-            HashMap<String,Integer> paramInts=new HashMap<String,Integer>(); 
+            HashMap<String,Integer> paramInts=new HashMap<String,Integer>();
+            ArrayList<String> invalidInts=new ArrayList<String>();
             for (IParameter p: dummyRequest.getParameters()){
                 if (p.getName().startsWith("string_")){
                     stdout.println("[+] Found string parameter: "+p.getName()+"="+p.getValue().toString());
                     paramStrings.put(p.getName(), helpers.urlDecode(p.getValue()));
                 }else if(p.getName().startsWith("int_")){
                     stdout.println("[+] Found int parameter: "+p.getName()+"="+p.getValue().toString());
-                    paramInts.put(p.getName(), Integer.parseInt(p.getValue()));
+                    try{
+                        paramInts.put(p.getName(), Integer.parseInt(p.getValue().trim()));
+                    }catch(NumberFormatException nfe){
+                        stdout.println("[!] Non-integer value for "+p.getName()+": \""+p.getValue()+"\"");
+                        invalidInts.add(p.getName()+" = \""+p.getValue()+"\"");
+                    }
                 }
+            }
+
+            // Don't silently drop bad integer input: tell the user which fields
+            // could not be applied, both as a modal dialog (so it is impossible
+            // to miss when forwarding) and as a Burp alert (persistent record).
+            // The invalid fields keep their original value; any other edits in
+            // the message are still applied.
+            if (!invalidInts.isEmpty()){
+                StringBuilder sb=new StringBuilder();
+                sb.append("These integer field(s) do not contain a valid whole number and were NOT applied:\n\n");
+                for (String s: invalidInts){
+                    sb.append("    - ").append(s).append("\n");
+                }
+                sb.append("\nThey keep their original value. Enter a valid integer (e.g. 123) to change them.");
+                String warning=sb.toString();
+                callbacks.issueAlert(warning);
+                javax.swing.JOptionPane.showMessageDialog(txtInput.getComponent(), warning,
+                        "Oracle Forms Serializer - invalid integer input", javax.swing.JOptionPane.ERROR_MESSAGE);
             }
 
             int bodyOffset;
