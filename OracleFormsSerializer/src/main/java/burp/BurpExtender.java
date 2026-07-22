@@ -111,6 +111,35 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         return resolved;
     }
 
+    // On-the-wire bytes of a String literal in the Forms stream: a 2-byte
+    // big-endian length followed by the modified-UTF-8 bytes, exactly as
+    // DataOutput.writeUTF() (readDetails reads them with readUTF). We use this
+    // to find and replace a literal in the raw body without re-serialising.
+    static byte[] utfBytes(String s) throws IOException {
+        ByteArrayOutputStream b=new ByteArrayOutputStream();
+        DataOutputStream d=new DataOutputStream(b);
+        d.writeUTF(s);
+        d.flush();
+        return b.toByteArray();
+    }
+
+    // First index of needle in haystack at or after `from`, or -1.
+    static int indexOf(byte[] haystack, byte[] needle, int from){
+        if (needle.length==0 || needle.length>haystack.length){
+            return -1;
+        }
+        outer:
+        for (int i=Math.max(from,0); i<=haystack.length-needle.length; i++){
+            for (int j=0;j<needle.length;j++){
+                if (haystack[i+j]!=needle[j]){
+                    continue outer;
+                }
+            }
+            return i;
+        }
+        return -1;
+    }
+
     @Override
     public void processHttpMessage(int toolFlag, boolean messageIsRequest, IHttpRequestResponse messageInfo){
         if(!messageIsRequest){  // We don't care if it's not a request
@@ -172,6 +201,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         private boolean editable;
         private ITextEditor txtInput;
         private byte[] currentMessage;
+        private boolean currentIsRequest = true;
 
         public OracleFormsInputTab(IMessageEditorController controller, boolean editable)
         {
@@ -216,17 +246,36 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             }
 
 
-            IRequestInfo rInfo=helpers.analyzeRequest(helpers.buildHttpService("dummyhost",1234,false),content);
-            byte[] body=Arrays.copyOfRange(content, rInfo.getBodyOffset(), content.length);
+            PrintWriter stdout = new PrintWriter(callbacks.getStdout(), true);
+
+            // Work out where the serialized Forms body starts. Requests and
+            // responses share the same Message framing, but the HTTP framing
+            // must be parsed with the matching analyzer.
+            int bodyOffset;
+            java.net.URL surfaceUrl;
+            if (isRequest){
+                IRequestInfo rInfo=helpers.analyzeRequest(helpers.buildHttpService("dummyhost",1234,false),content);
+                bodyOffset=rInfo.getBodyOffset();
+                surfaceUrl=rInfo.getUrl();
+            }else{
+                IResponseInfo rInfo=helpers.analyzeResponse(content);
+                bodyOffset=rInfo.getBodyOffset();
+                surfaceUrl=null; // responses have no URL; use a placeholder below
+            }
+
+            byte[] body=Arrays.copyOfRange(content, bodyOffset, content.length);
             String[] as=new String[256];
             ByteArrayInputStream bis=new ByteArrayInputStream(body);
             DataInputStream dis=new DataInputStream(bis);
-            PrintWriter stdout = new PrintWriter(callbacks.getStdout(), true);
             Message m;
-            if(!isRequest){
+
+            // Responses are only editable where Burp offers an editable editor
+            // (e.g. Proxy intercept). Everywhere else (Proxy history, Repeater
+            // response pane) keep the richer read-only recursive dump.
+            if(!isRequest && !editable){
                 try{
                     StringBuilder sb=new StringBuilder();
-                    
+
                     while((m=Message.readDetails(dis,as))!=null){
                         sb.append(messageToString(m));
                         sb.append("\n+++ Message +++\n");
@@ -244,9 +293,16 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 }
             }else
             {
-                byte[] dummyRequest=helpers.buildHttpRequest(rInfo.getUrl()); // [TODO] POST plz
+                if (surfaceUrl==null){
+                    try{
+                        surfaceUrl=new java.net.URL("http://oracle-forms-response/lservlet");
+                    }catch(java.net.MalformedURLException mue){
+                        stdout.println("Could not build placeholder URL for response surface");
+                    }
+                }
+                byte[] dummyRequest=helpers.buildHttpRequest(surfaceUrl); // [TODO] POST plz
                 int m_id=0;
-                
+
                 try{
                     while((m=Message.readDetails(dis,as))!=null){
                         for (int i=0;i<m.size();i++){
@@ -266,17 +322,21 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     }
                     dummyRequest=helpers.addParameter(dummyRequest, helpers.buildParameter("original", byteArrayToHex(body), IParameter.PARAM_BODY));
                     txtInput.setText(dummyRequest);
-                    txtInput.setEditable(true);
+                    txtInput.setEditable(editable);
                 }catch(EOFException eofe){
                     stdout.println("\nReached EOFin setMessage()");
                 }catch(IOException e){
                     stdout.println("Message IOException");
                     e.printStackTrace(stdout);
+                }catch(IllegalArgumentException iae){
+                    stdout.println("Message IllegalArgumentException in setMessage()");
+                    iae.printStackTrace(stdout);
                 }
             }
-            
+
             // remember the displayed content
             currentMessage = content;
+            currentIsRequest = isRequest;
         }
 
         @Override
@@ -299,8 +359,30 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 }
             }
 
-            IRequestInfo rInfo=helpers.analyzeRequest(currentMessage);
-            byte[] body=Arrays.copyOfRange(currentMessage, rInfo.getBodyOffset(), currentMessage.length);
+            int bodyOffset;
+            List<String> httpHeaders;
+            if (currentIsRequest){
+                IRequestInfo rInfo=helpers.analyzeRequest(currentMessage);
+                bodyOffset=rInfo.getBodyOffset();
+                httpHeaders=rInfo.getHeaders();
+            }else{
+                IResponseInfo rInfo=helpers.analyzeResponse(currentMessage);
+                bodyOffset=rInfo.getBodyOffset();
+                httpHeaders=rInfo.getHeaders();
+            }
+            byte[] body=Arrays.copyOfRange(currentMessage, bodyOffset, currentMessage.length);
+
+            // Responses cannot be re-serialised: frmall.jar is the CLIENT
+            // library, so Message.writeDetails() only knows how to emit
+            // request-side constructs. Server->client messages carry types the
+            // client merely decodes and never re-encodes (IndexTag, DeleteMask,
+            // delta masks, ...), so writeDetails throws on them. Instead we
+            // patch the edited string(s) directly into the original response
+            // bytes and leave everything else untouched.
+            if (!currentIsRequest){
+                return patchResponse(body, httpHeaders, paramStrings, paramInts, stdout);
+            }
+
             String[] as=new String[256];
             ByteArrayInputStream bis=new ByteArrayInputStream(body);
             DataInputStream dis=new DataInputStream(bis);
@@ -372,12 +454,105 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             try{
                 dos.writeByte(-16);
                 dos.writeByte(0x01);
-                return helpers.buildHttpMessage(rInfo.getHeaders(), baos.toByteArray());
+                return helpers.buildHttpMessage(httpHeaders, baos.toByteArray());
             }catch(IOException e){
                 stdout.println("Message IOException - last bytes");
                 e.printStackTrace(stdout);
                 return null;
             }
+        }
+
+        // Apply string edits to a response by patching the raw body in place
+        // instead of re-serialising it (see getMessage() for why re-serialising
+        // responses is impossible). We re-parse the original body only to learn
+        // each editable property's original value, then find that literal's
+        // writeUTF bytes in the body and swap in the new value's bytes. String
+        // references are index-based, so changing a literal's length keeps the
+        // rest of the stream valid.
+        private byte[] patchResponse(byte[] body, List<String> httpHeaders,
+                                     HashMap<String,String> paramStrings,
+                                     HashMap<String,Integer> paramInts, PrintWriter stdout)
+        {
+            HashMap<String,String> origStrings=new HashMap<String,String>();
+            HashMap<String,Integer> origInts=new HashMap<String,Integer>();
+            String[] as=new String[256];
+            try{
+                ByteArrayInputStream bis=new ByteArrayInputStream(body);
+                DataInputStream dis=new DataInputStream(bis);
+                Message m;
+                int m_id=0;
+                while((m=Message.readDetails(dis,as))!=null){
+                    for (int i=0;i<m.size();i++){
+                        Object v=m.getValueAt(i);
+                        if (v==null){
+                            continue;
+                        }
+                        if (m.getPropertyTypeAt(i)==1){
+                            origStrings.put(String.format("string_%d_%d",m_id,i), v.toString());
+                        }else if (m.getPropertyTypeAt(i)==3){
+                            try{
+                                origInts.put(String.format("int_%d_%d",m_id,i), Integer.valueOf(v.toString()));
+                            }catch(NumberFormatException nfe){}
+                        }
+                    }
+                    m_id++;
+                }
+            }catch(EOFException eofe){
+                // normal end of stream
+            }catch(Exception e){
+                stdout.println("[!] Failed to parse original response body for patching; forwarding unchanged:");
+                e.printStackTrace(stdout);
+                return currentMessage;
+            }
+
+            byte[] patched=body;
+            int changes=0;
+            for (String key: paramStrings.keySet()){
+                String newV=paramStrings.get(key);
+                String oldV=origStrings.get(key);
+                if (oldV==null || oldV.equals(newV)){
+                    continue; // unknown key or value untouched by the user
+                }
+                try{
+                    byte[] oldPat=utfBytes(oldV);
+                    byte[] newPat=utfBytes(newV);
+                    int idx=indexOf(patched, oldPat, 0);
+                    if (idx<0){
+                        stdout.println("[!] Could not locate literal bytes for "+key+" (\""+oldV+"\") in the response body; this edit was skipped.");
+                        stdout.println("[!] The value is probably stored with an encoding this patcher does not recognise. Body hex follows so the format can be analysed:");
+                        stdout.println(byteArrayToHex(patched));
+                        continue;
+                    }
+                    if (indexOf(patched, oldPat, idx+oldPat.length)>=0){
+                        stdout.println("[!] Literal for "+key+" (\""+oldV+"\") occurs more than once; patching first occurrence at offset "+idx+" only.");
+                    }
+                    byte[] nb=new byte[patched.length-oldPat.length+newPat.length];
+                    System.arraycopy(patched,0,nb,0,idx);
+                    System.arraycopy(newPat,0,nb,idx,newPat.length);
+                    System.arraycopy(patched,idx+oldPat.length,nb,idx+newPat.length,patched.length-(idx+oldPat.length));
+                    patched=nb;
+                    changes++;
+                    stdout.println("[+] Patched "+key+": \""+oldV+"\" -> \""+newV+"\" at body offset "+idx);
+                }catch(IOException ioe){
+                    stdout.println("[!] Failed to encode replacement for "+key+"; edit skipped.");
+                    ioe.printStackTrace(stdout);
+                }
+            }
+
+            int intEdits=0;
+            for (String key: paramInts.keySet()){
+                Integer newV=paramInts.get(key);
+                Integer oldV=origInts.get(key);
+                if (oldV!=null && !oldV.equals(newV)){
+                    intEdits++;
+                }
+            }
+            if (intEdits>0){
+                stdout.println("[*] Note: integer edits are not supported for responses (ambiguous to locate by value); "+intEdits+" changed int field(s) ignored.");
+            }
+
+            stdout.println("[*] Response patch complete: "+changes+" string(s) changed, new body length "+patched.length);
+            return helpers.buildHttpMessage(httpHeaders, patched);
         }
 
         @Override
