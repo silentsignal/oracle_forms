@@ -46,6 +46,16 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
     private static final String MR_RULES_SETTING="oracle_forms_mr_rules";
     private static final String MR_ENABLED_SETTING="oracle_forms_mr_enabled";
 
+    // Global boolean policy for requests (responses cannot be re-serialised).
+    // Applies to every Boolean property in the message tree. Independent of the
+    // match/replace rule table, but gated by the master enable switch along with
+    // the rest of the engine; the dropdown's "Leave unchanged" is its own off state.
+    private static final int BOOL_NONE=0, BOOL_FLIP=1, BOOL_TRUE=2, BOOL_FALSE=3;
+    private static final String[] BOOL_MODE_LABELS={
+        "Leave unchanged", "Flip all (true<->false)", "Set all to true", "Set all to false"};
+    private volatile int boolRequestMode=BOOL_NONE;
+    private static final String BOOL_MODE_SETTING="oracle_forms_bool_mode";
+
     // Extension options.
     private volatile boolean debugEnabled=false;
     private static final String DEBUG_SETTING="oracle_forms_debug";
@@ -183,14 +193,19 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
     // message 12 property 5 is still string_12_5.
     private void collectStrings(Message m, String prefix,
                                java.util.Map<String,String> strings,
-                               java.util.Map<String,Integer> ints){
+                               java.util.Map<String,Integer> ints,
+                               java.util.Map<String,Boolean> bools){
         for (int i=0;i<m.size();i++){
             Object v=m.getValueAt(i);
             if (v==null){
                 continue;
             }
             if (v instanceof Message){
-                collectStrings((Message)v, prefix+"_"+i, strings, ints); // descend into nested Message
+                collectStrings((Message)v, prefix+"_"+i, strings, ints, bools); // descend into nested Message
+            }else if (v instanceof Boolean){
+                // Detect by value type, not the numeric property-type code:
+                // the value round-trips through writeDetails as a Boolean.
+                bools.put("bool"+prefix+"_"+i, (Boolean)v);
             }else if (m.getPropertyTypeAt(i)==1){
                 strings.put("string"+prefix+"_"+i, v.toString());
             }else if (m.getPropertyTypeAt(i)==3){
@@ -207,11 +222,21 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
     // actually changed are written, to avoid needless re-encoding.
     private void applyEdits(Message m, String prefix,
                            java.util.Map<String,String> paramStrings,
-                           java.util.Map<String,Integer> paramInts, PrintWriter stdout){
+                           java.util.Map<String,Integer> paramInts,
+                           java.util.Map<String,Boolean> paramBools, PrintWriter stdout){
         for (int i=0;i<m.size();i++){
             Object v=m.getValueAt(i);
             if (v instanceof Message){
-                applyEdits((Message)v, prefix+"_"+i, paramStrings, paramInts, stdout); // descend into nested Message
+                applyEdits((Message)v, prefix+"_"+i, paramStrings, paramInts, paramBools, stdout); // descend into nested Message
+            }else if (v instanceof Boolean){
+                String key="bool"+prefix+"_"+i;
+                if (paramBools.containsKey(key)){
+                    Boolean newVal=paramBools.get(key);
+                    if (!newVal.equals(v)){
+                        debug("[+] Setting Boolean value for "+key+" -> "+newVal);
+                        m.setValueAt(i, newVal);
+                    }
+                }
             }else if (m.getPropertyTypeAt(i)==1){
                 String key="string"+prefix+"_"+i;
                 if (paramStrings.containsKey(key)){
@@ -355,6 +380,45 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         return changes;
     }
 
+    // Whether the global boolean policy should run on requests. Gated by both
+    // the master enable switch and a non-"Leave unchanged" dropdown selection,
+    // so the master switch governs booleans along with the rest of the engine.
+    private boolean boolPolicyActive(){
+        return matchReplaceEnabled && boolRequestMode!=BOOL_NONE;
+    }
+
+    // Apply the global boolean policy (flip / force true / force false) to every
+    // Boolean property in the tree, descending into nested Messages. Booleans are
+    // detected by value type, so no property-type code is needed. Returns the
+    // number of values changed.
+    private int applyBoolPolicy(Message m){
+        if (boolRequestMode==BOOL_NONE){
+            return 0;
+        }
+        int changes=0;
+        for (int i=0;i<m.size();i++){
+            Object v=m.getValueAt(i);
+            if (v instanceof Message){
+                changes+=applyBoolPolicy((Message)v);
+            }else if (v instanceof Boolean){
+                boolean cur=((Boolean)v).booleanValue();
+                boolean nv;
+                switch(boolRequestMode){
+                    case BOOL_FLIP:  nv=!cur;  break;
+                    case BOOL_TRUE:  nv=true;  break;
+                    case BOOL_FALSE: nv=false; break;
+                    default:         nv=cur;
+                }
+                if (nv!=cur){
+                    debug("[*] Forms boolean policy: "+cur+" -> "+nv);
+                    m.setValueAt(i, Boolean.valueOf(nv));
+                    changes++;
+                }
+            }
+        }
+        return changes;
+    }
+
     // Collect the distinct string values present anywhere in a message tree.
     private void collectStringValues(Message m, Set<String> out){
         for (int i=0;i<m.size();i++){
@@ -385,6 +449,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         try{
             while((m=Message.readDetails(dis,localAs))!=null){
                 totalChanges+=applyMatchReplaceToMessage(m);
+                totalChanges+=applyBoolPolicy(m);
                 resolveIndexTags(m);
                 m.writeDetails(dispatcher, dos);
             }
@@ -489,6 +554,13 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             matchReplaceEnabled="true".equals(callbacks.loadExtensionSetting(MR_ENABLED_SETTING));
             debugEnabled="true".equals(callbacks.loadExtensionSetting(DEBUG_SETTING));
             frmHighlightEnabled=!"false".equals(callbacks.loadExtensionSetting(FRM_HIGHLIGHT_SETTING)); // default on
+            try{
+                String bm=callbacks.loadExtensionSetting(BOOL_MODE_SETTING);
+                int parsed=(bm==null||bm.isEmpty())?BOOL_NONE:Integer.parseInt(bm.trim());
+                boolRequestMode=(parsed>=BOOL_NONE && parsed<=BOOL_FALSE)?parsed:BOOL_NONE;
+            }catch(NumberFormatException nfe){
+                boolRequestMode=BOOL_NONE;
+            }
             String data=callbacks.loadExtensionSetting(MR_RULES_SETTING);
             mrRules.clear();
             if (data!=null && !data.isEmpty()){
@@ -522,6 +594,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             callbacks.saveExtensionSetting(MR_ENABLED_SETTING, matchReplaceEnabled?"true":"false");
             callbacks.saveExtensionSetting(DEBUG_SETTING, debugEnabled?"true":"false");
             callbacks.saveExtensionSetting(FRM_HIGHLIGHT_SETTING, frmHighlightEnabled?"true":"false");
+            callbacks.saveExtensionSetting(BOOL_MODE_SETTING, Integer.toString(boolRequestMode));
         }catch(Exception e){
             stdout.println("[!] Failed to save match/replace settings: "+e);
         }
@@ -588,8 +661,9 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             return; // don't attempt match/replace on a body we couldn't decode
         }
 
-        // Automatic match/replace on the (validated) request body.
-        if (hasApplicableRules(true)){
+        // Automatic match/replace and/or global boolean policy on the
+        // (validated) request body.
+        if (hasApplicableRules(true) || boolPolicyActive()){
             try{
                 byte[] newBody=transformRequestBody(body);
                 if (newBody!=null){
@@ -802,8 +876,9 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     // the same recursive keys back onto the message tree.
                     java.util.LinkedHashMap<String,String> strings=new java.util.LinkedHashMap<String,String>();
                     java.util.LinkedHashMap<String,Integer> ints=new java.util.LinkedHashMap<String,Integer>();
+                    java.util.LinkedHashMap<String,Boolean> bools=new java.util.LinkedHashMap<String,Boolean>();
                     while((m=Message.readDetails(dis,as))!=null){
-                        collectStrings(m, "_"+m_id, strings, ints);
+                        collectStrings(m, "_"+m_id, strings, ints, bools);
                         m_id++;
                     }
                     for (java.util.Map.Entry<String,String> e: strings.entrySet()){
@@ -811,6 +886,15 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     }
                     for (java.util.Map.Entry<String,Integer> e: ints.entrySet()){
                         dummyRequest=helpers.addParameter(dummyRequest, helpers.buildParameter(e.getKey(), e.getValue().toString(), IParameter.PARAM_BODY));
+                    }
+                    // Booleans are only re-applied on the request re-serialisation
+                    // path (responses cannot be re-serialised), so expose an
+                    // editable true/false field only for requests. Flip one to
+                    // switch that property in the forwarded request.
+                    if (isRequest){
+                        for (java.util.Map.Entry<String,Boolean> e: bools.entrySet()){
+                            dummyRequest=helpers.addParameter(dummyRequest, helpers.buildParameter(e.getKey(), e.getValue().toString(), IParameter.PARAM_BODY));
+                        }
                     }
                     dummyRequest=helpers.addParameter(dummyRequest, helpers.buildParameter("original", byteArrayToHex(body), IParameter.PARAM_BODY));
                     txtInput.setText(dummyRequest);
@@ -841,7 +925,9 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             IRequestInfo dummyRequest=helpers.analyzeRequest(txtInput.getText());
             HashMap<String,String> paramStrings=new HashMap<String,String>(); // Not necessarily optimal, but code is nicer...
             HashMap<String,Integer> paramInts=new HashMap<String,Integer>();
+            HashMap<String,Boolean> paramBools=new HashMap<String,Boolean>();
             ArrayList<String> invalidInts=new ArrayList<String>();
+            ArrayList<String> invalidBools=new ArrayList<String>();
             for (IParameter p: dummyRequest.getParameters()){
                 if (p.getName().startsWith("string_")){
                     debug("[+] Found string parameter: "+p.getName()+"="+p.getValue().toString());
@@ -854,6 +940,17 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                         stdout.println("[!] Non-integer value for "+p.getName()+": \""+p.getValue()+"\"");
                         invalidInts.add(p.getName()+" = \""+p.getValue()+"\"");
                     }
+                }else if(p.getName().startsWith("bool_")){
+                    debug("[+] Found bool parameter: "+p.getName()+"="+p.getValue().toString());
+                    String raw=helpers.urlDecode(p.getValue()).trim();
+                    if ("true".equalsIgnoreCase(raw)){
+                        paramBools.put(p.getName(), Boolean.TRUE);
+                    }else if ("false".equalsIgnoreCase(raw)){
+                        paramBools.put(p.getName(), Boolean.FALSE);
+                    }else{
+                        stdout.println("[!] Non-boolean value for "+p.getName()+": \""+p.getValue()+"\"");
+                        invalidBools.add(p.getName()+" = \""+p.getValue()+"\"");
+                    }
                 }
             }
 
@@ -862,13 +959,16 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             // to miss when forwarding) and as a Burp alert (persistent record).
             // The invalid fields keep their original value; any other edits in
             // the message are still applied.
-            if (!invalidInts.isEmpty()){
+            if (!invalidInts.isEmpty() || !invalidBools.isEmpty()){
                 StringBuilder sb=new StringBuilder();
-                sb.append("These integer field(s) do not contain a valid whole number and were NOT applied:\n\n");
+                sb.append("These field(s) had invalid input and were NOT applied:\n\n");
                 for (String s: invalidInts){
-                    sb.append("    - ").append(s).append("\n");
+                    sb.append("    - integer ").append(s).append("   (needs a whole number, e.g. 123)\n");
                 }
-                sb.append("\nThey keep their original value. Enter a valid integer (e.g. 123) to change them.");
+                for (String s: invalidBools){
+                    sb.append("    - boolean ").append(s).append("   (needs true or false)\n");
+                }
+                sb.append("\nThey keep their original value; any other edits are still applied.");
                 String warning=sb.toString();
                 callbacks.issueAlert(warning);
                 javax.swing.JOptionPane.showMessageDialog(txtInput.getComponent(), warning,
@@ -925,7 +1025,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     // Apply edits recursively so strings/ints nested inside other
                     // Message objects are updated too, not just top-level ones.
                     // Only genuinely changed values are re-set (see applyEdits).
-                    applyEdits(m, "_"+m_id, paramStrings, paramInts, stdout);
+                    applyEdits(m, "_"+m_id, paramStrings, paramInts, paramBools, stdout);
                     int resolved=resolveIndexTags(m);
                     if (resolved>0){
                         debug("[*] Resolved "+resolved+" IndexTag reference(s) before writing message "+m_id);
@@ -982,7 +1082,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 Message m;
                 int m_id=0;
                 while((m=Message.readDetails(dis,as))!=null){
-                    collectStrings(m, "_"+m_id, origStrings, origInts); // same recursive keys as the editable surface
+                    collectStrings(m, "_"+m_id, origStrings, origInts, new HashMap<String,Boolean>()); // same recursive keys as the editable surface; booleans unused on the response path
                     m_id++;
                 }
             }catch(EOFException eofe){
@@ -1183,13 +1283,24 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             panel=new javax.swing.JPanel(new java.awt.BorderLayout());
 
             // Options panel (vertical): each checkbox writes its flag + persists.
-            final javax.swing.JCheckBox master=new javax.swing.JCheckBox("Enable Oracle Forms match/replace", matchReplaceEnabled);
+            // The master switch is the single on/off for the whole engine (rules
+            // AND the boolean policy), so make it visually stand out: bold,
+            // enlarged, and in its own bordered banner above the other options.
+            final javax.swing.JCheckBox master=new javax.swing.JCheckBox("Enable Oracle Forms match/replace  (master switch — rules + boolean policy)", matchReplaceEnabled);
+            master.setToolTipText("Master on/off for all automatic Forms processing: match/replace rules and the boolean policy below.");
+            java.awt.Font masterFont=master.getFont();
+            master.setFont(masterFont.deriveFont(java.awt.Font.BOLD, masterFont.getSize2D()+3f));
             master.addActionListener(new java.awt.event.ActionListener(){
                 public void actionPerformed(java.awt.event.ActionEvent e){
                     matchReplaceEnabled=master.isSelected();
                     saveMatchReplaceSettings();
                 }
             });
+            javax.swing.JPanel masterBanner=new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 6));
+            masterBanner.setBorder(javax.swing.BorderFactory.createCompoundBorder(
+                    javax.swing.BorderFactory.createEmptyBorder(6,6,6,6),
+                    javax.swing.BorderFactory.createEtchedBorder()));
+            masterBanner.add(master);
             final javax.swing.JCheckBox frmBox=new javax.swing.JCheckBox("Highlight FRM/ORA errors in responses", frmHighlightEnabled);
             frmBox.addActionListener(new java.awt.event.ActionListener(){
                 public void actionPerformed(java.awt.event.ActionEvent e){
@@ -1204,13 +1315,38 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     saveMatchReplaceSettings();
                 }
             });
+            // Global boolean policy for requests: a single dropdown applied to
+            // every Boolean property. Gated by the master switch above.
+            final javax.swing.JComboBox<String> boolMode=new javax.swing.JComboBox<String>(BOOL_MODE_LABELS);
+            boolMode.setToolTipText("Applies to every boolean in Forms requests. Requires the master switch above to be enabled.");
+            boolMode.setSelectedIndex(boolRequestMode);
+            boolMode.setMaximumSize(boolMode.getPreferredSize());
+            boolMode.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){
+                    boolRequestMode=boolMode.getSelectedIndex();
+                    saveMatchReplaceSettings();
+                }
+            });
+            javax.swing.JPanel boolRow=new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 0, 0));
+            boolRow.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+            boolRow.add(new javax.swing.JLabel("Booleans in requests: "));
+            boolRow.add(boolMode);
+
             javax.swing.JPanel top=new javax.swing.JPanel();
             top.setLayout(new javax.swing.BoxLayout(top, javax.swing.BoxLayout.Y_AXIS));
             top.setBorder(javax.swing.BorderFactory.createTitledBorder("Options"));
-            top.add(master);
             top.add(frmBox);
             top.add(debugBox);
-            panel.add(top, java.awt.BorderLayout.NORTH);
+            top.add(boolRow);
+
+            // Master banner on top, secondary options below it.
+            javax.swing.JPanel north=new javax.swing.JPanel();
+            north.setLayout(new javax.swing.BoxLayout(north, javax.swing.BoxLayout.Y_AXIS));
+            masterBanner.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+            top.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+            north.add(masterBanner);
+            north.add(top);
+            panel.add(north, java.awt.BorderLayout.NORTH);
 
             model=new MRTableModel();
             final javax.swing.JTable table=new javax.swing.JTable(model);
@@ -1499,7 +1635,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 if (v instanceof Message){
                     node.add(buildMessageNode((Message)v, "Property "+i+" [id="+propId+"] (nested message)"));
                 }else{
-                    String tlabel=(t==1?"String":(t==3?"Integer":"type"+t));
+                    String tlabel=(t==1?"String":(t==3?"Integer":(v instanceof Boolean?"Boolean":"type"+t)));
                     String prefix=(t==3?"[int] ":"");
                     String val=(v==null?"null":v.toString());
                     node.add(new javax.swing.tree.DefaultMutableTreeNode(
