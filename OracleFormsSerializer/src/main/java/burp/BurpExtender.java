@@ -321,6 +321,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 String orig=v.toString();
                 String repl=applyStringRules(orig, true);
                 if (repl!=null && !repl.equals(orig)){
+                    stdout.println("[*] Forms match/replace: request string \""+orig+"\" -> \""+repl+"\"");
                     m.setValueAt(i, repl);
                     changes++;
                 }
@@ -329,6 +330,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     int iv=Integer.parseInt(v.toString());
                     int repl=applyIntRules(iv, true);
                     if (repl!=iv){
+                        stdout.println("[*] Forms match/replace: request int "+iv+" -> "+repl);
                         m.setValueAt(i, Integer.valueOf(repl));
                         changes++;
                     }
@@ -520,14 +522,15 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
     @Override
     public void processHttpMessage(int toolFlag, boolean messageIsRequest, IHttpRequestResponse messageInfo){
         if(!messageIsRequest){  // We don't care if it's not a request
+            processResponseForMatchReplace(messageInfo);
             return;
         }
 
         byte[] msg=messageInfo.getRequest();
         IRequestInfo rInfo=helpers.analyzeRequest(messageInfo);
 
-        if (rInfo.getUrl().toString().indexOf("/lservlet") == -1 || rInfo.getMethod() != "POST"){ // We don't care if it's not a POST for Forms
-            return; 
+        if (rInfo.getUrl().toString().indexOf("/lservlet") == -1 || !"POST".equalsIgnoreCase(rInfo.getMethod())){ // We don't care if it's not a POST for Forms
+            return;
         }
 
         byte[] handshakeBody=Arrays.copyOfRange(msg, rInfo.getBodyOffset(), rInfo.getBodyOffset() + 4);
@@ -563,6 +566,58 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             stdout.println("Caught exception while decoding Forms HTTP request! Redirecting to localhost...");
             stdout.println(e.getMessage());
             messageInfo.setHttpService(helpers.buildHttpService("127.0.0.1",65535,false));
+            return; // don't attempt match/replace on a body we couldn't decode
+        }
+
+        // Automatic match/replace on the (validated) request body.
+        if (hasApplicableRules(true)){
+            try{
+                byte[] newBody=transformRequestBody(body);
+                if (newBody!=null){
+                    messageInfo.setRequest(helpers.buildHttpMessage(rInfo.getHeaders(), newBody));
+                    stdout.println("[*] Forms match/replace applied to request");
+                }else{
+                    stdout.println("[*] Forms match/replace: no request rule matched this message");
+                }
+            }catch(RuntimeException re){
+                stdout.println("[!] Forms match/replace request error, left unchanged: "+re);
+            }
+        }
+    }
+
+    // Response direction of processHttpMessage(): apply string match/replace to
+    // Forms responses by byte-patching (responses cannot be re-serialised).
+    private void processResponseForMatchReplace(IHttpRequestResponse messageInfo){
+        if (!hasApplicableRules(false)){
+            return;
+        }
+        byte[] resp=messageInfo.getResponse();
+        if (resp==null){
+            return;
+        }
+        // Only Forms responses: the originating request targets /lservlet and
+        // the response is the binary Forms stream.
+        IRequestInfo reqInfo=helpers.analyzeRequest(messageInfo);
+        if (reqInfo.getUrl().toString().indexOf("/lservlet") == -1){
+            return;
+        }
+        IResponseInfo respInfo=helpers.analyzeResponse(resp);
+        String ct=getHeaderValue(respInfo.getHeaders(), "content-type");
+        if (ct==null || ct.toLowerCase().indexOf("application/octet-stream")==-1){
+            return;
+        }
+        byte[] body=Arrays.copyOfRange(resp, respInfo.getBodyOffset(), resp.length);
+        if (body.length==0){
+            return;
+        }
+        try{
+            byte[] newBody=transformResponseBody(body);
+            if (newBody!=null){
+                messageInfo.setResponse(helpers.buildHttpMessage(respInfo.getHeaders(), newBody));
+                stdout.println("[*] Forms match/replace applied to response");
+            }
+        }catch(RuntimeException re){
+            stdout.println("[!] Forms match/replace response error, left unchanged: "+re);
         }
     }
 
