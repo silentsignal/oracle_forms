@@ -49,6 +49,9 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
     // Extension options.
     private volatile boolean debugEnabled=false;
     private static final String DEBUG_SETTING="oracle_forms_debug";
+    private volatile boolean frmHighlightEnabled=true;
+    private static final String FRM_HIGHLIGHT_SETTING="oracle_forms_frm_highlight";
+    private static final Pattern FRM_ERROR_PATTERN=Pattern.compile("(?:FRM|ORA)-\\d+");
 
     // Verbose trace output; silenced unless the user enables debug in the tab.
     private void debug(String s){
@@ -484,6 +487,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         try{
             matchReplaceEnabled="true".equals(callbacks.loadExtensionSetting(MR_ENABLED_SETTING));
             debugEnabled="true".equals(callbacks.loadExtensionSetting(DEBUG_SETTING));
+            frmHighlightEnabled=!"false".equals(callbacks.loadExtensionSetting(FRM_HIGHLIGHT_SETTING)); // default on
             String data=callbacks.loadExtensionSetting(MR_RULES_SETTING);
             mrRules.clear();
             if (data!=null && !data.isEmpty()){
@@ -516,6 +520,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             callbacks.saveExtensionSetting(MR_RULES_SETTING, sb.toString());
             callbacks.saveExtensionSetting(MR_ENABLED_SETTING, matchReplaceEnabled?"true":"false");
             callbacks.saveExtensionSetting(DEBUG_SETTING, debugEnabled?"true":"false");
+            callbacks.saveExtensionSetting(FRM_HIGHLIGHT_SETTING, frmHighlightEnabled?"true":"false");
         }catch(Exception e){
             stdout.println("[!] Failed to save match/replace settings: "+e);
         }
@@ -535,7 +540,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
     @Override
     public void processHttpMessage(int toolFlag, boolean messageIsRequest, IHttpRequestResponse messageInfo){
         if(!messageIsRequest){  // We don't care if it's not a request
-            processResponseForMatchReplace(messageInfo);
+            processResponse(messageInfo);
             return;
         }
 
@@ -598,11 +603,13 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         }
     }
 
-    // Response direction of processHttpMessage(): apply string match/replace to
-    // Forms responses by byte-patching (responses cannot be re-serialised).
-    private void processResponseForMatchReplace(IHttpRequestResponse messageInfo){
-        if (!hasApplicableRules(false)){
-            return;
+    // Response direction of processHttpMessage(): highlight FRM/ORA errors and
+    // apply string match/replace to Forms responses (byte-patched, since
+    // responses cannot be re-serialised).
+    private void processResponse(IHttpRequestResponse messageInfo){
+        boolean mrActive=hasApplicableRules(false);
+        if (!frmHighlightEnabled && !mrActive){
+            return; // nothing to do
         }
         byte[] resp=messageInfo.getResponse();
         if (resp==null){
@@ -623,15 +630,55 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         if (body.length==0){
             return;
         }
-        try{
-            byte[] newBody=transformResponseBody(body);
-            if (newBody!=null){
-                messageInfo.setResponse(helpers.buildHttpMessage(respInfo.getHeaders(), newBody));
-                stdout.println("[*] Forms match/replace applied to response");
-            }
-        }catch(RuntimeException re){
-            stdout.println("[!] Forms match/replace response error, left unchanged: "+re);
+
+        if (frmHighlightEnabled){
+            highlightFormsErrors(messageInfo, body);
         }
+
+        if (mrActive){
+            try{
+                byte[] newBody=transformResponseBody(body);
+                if (newBody!=null){
+                    messageInfo.setResponse(helpers.buildHttpMessage(respInfo.getHeaders(), newBody));
+                    stdout.println("[*] Forms match/replace applied to response");
+                }
+            }catch(RuntimeException re){
+                stdout.println("[!] Forms match/replace response error, left unchanged: "+re);
+            }
+        }
+    }
+
+    // Flag Forms responses that carry FRM-/ORA- error codes. The error strings
+    // are ASCII in the serialized body, so a regex over the raw bytes finds them
+    // without a full parse. Sets a red history highlight + comment and raises an
+    // alert, so authorization checks (e.g. FRM-41084) stand out during recon.
+    private void highlightFormsErrors(IHttpRequestResponse messageInfo, byte[] body){
+        String text=new String(body, java.nio.charset.StandardCharsets.ISO_8859_1);
+        java.util.regex.Matcher mch=FRM_ERROR_PATTERN.matcher(text);
+        LinkedHashSet<String> codes=new LinkedHashSet<String>();
+        while (mch.find()){
+            codes.add(mch.group());
+        }
+        if (codes.isEmpty()){
+            return;
+        }
+        StringBuilder sb=new StringBuilder();
+        for (String c: codes){
+            if (sb.length()>0){
+                sb.append(", ");
+            }
+            sb.append(c);
+        }
+        String joined=sb.toString();
+        messageInfo.setHighlight("red");
+        String existing=messageInfo.getComment();
+        if (existing==null || existing.isEmpty()){
+            messageInfo.setComment(joined);
+        }else if (existing.indexOf(joined)==-1){
+            messageInfo.setComment(existing+" | "+joined);
+        }
+        stdout.println("[*] Oracle Forms error(s) in response: "+joined);
+        callbacks.issueAlert("Oracle Forms error in response: "+joined);
     }
 
     @Override
@@ -1142,6 +1189,13 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     saveMatchReplaceSettings();
                 }
             });
+            final javax.swing.JCheckBox frmBox=new javax.swing.JCheckBox("Highlight FRM/ORA errors in responses", frmHighlightEnabled);
+            frmBox.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){
+                    frmHighlightEnabled=frmBox.isSelected();
+                    saveMatchReplaceSettings();
+                }
+            });
             final javax.swing.JCheckBox debugBox=new javax.swing.JCheckBox("Show debug output in extension output", debugEnabled);
             debugBox.addActionListener(new java.awt.event.ActionListener(){
                 public void actionPerformed(java.awt.event.ActionEvent e){
@@ -1153,6 +1207,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             top.setLayout(new javax.swing.BoxLayout(top, javax.swing.BoxLayout.Y_AXIS));
             top.setBorder(javax.swing.BorderFactory.createTitledBorder("Options"));
             top.add(master);
+            top.add(frmBox);
             top.add(debugBox);
             panel.add(top, java.awt.BorderLayout.NORTH);
 
