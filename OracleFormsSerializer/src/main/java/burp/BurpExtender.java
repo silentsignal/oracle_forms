@@ -46,6 +46,17 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
     private static final String MR_RULES_SETTING="oracle_forms_mr_rules";
     private static final String MR_ENABLED_SETTING="oracle_forms_mr_enabled";
 
+    // Extension options.
+    private volatile boolean debugEnabled=false;
+    private static final String DEBUG_SETTING="oracle_forms_debug";
+
+    // Verbose trace output; silenced unless the user enables debug in the tab.
+    private void debug(String s){
+        if (debugEnabled){
+            stdout.println(s);
+        }
+    }
+
     @Override
     public void registerExtenderCallbacks(IBurpExtenderCallbacks callbacks)
     {   
@@ -202,7 +213,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 if (paramStrings.containsKey(key)){
                     String newVal=paramStrings.get(key);
                     if (v==null || !newVal.equals(v.toString())){
-                        stdout.println("[+] Setting String value for "+key);
+                        debug("[+] Setting String value for "+key);
                         m.setValueAt(i, newVal);
                     }
                 }
@@ -211,7 +222,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 if (paramInts.containsKey(key)){
                     Integer newVal=paramInts.get(key);
                     if (v==null || !newVal.toString().equals(v.toString())){
-                        stdout.println("[+] Setting Integer value for "+key);
+                        debug("[+] Setting Integer value for "+key);
                         m.setValueAt(i, newVal);
                     }
                 }
@@ -321,7 +332,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 String orig=v.toString();
                 String repl=applyStringRules(orig, true);
                 if (repl!=null && !repl.equals(orig)){
-                    stdout.println("[*] Forms match/replace: request string \""+orig+"\" -> \""+repl+"\"");
+                    debug("[*] Forms match/replace: request string \""+orig+"\" -> \""+repl+"\"");
                     m.setValueAt(i, repl);
                     changes++;
                 }
@@ -330,7 +341,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     int iv=Integer.parseInt(v.toString());
                     int repl=applyIntRules(iv, true);
                     if (repl!=iv){
-                        stdout.println("[*] Forms match/replace: request int "+iv+" -> "+repl);
+                        debug("[*] Forms match/replace: request int "+iv+" -> "+repl);
                         m.setValueAt(i, Integer.valueOf(repl));
                         changes++;
                     }
@@ -425,14 +436,14 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 patched=replaceAll(patched, utfBytes(oldV), utfBytes(newV));
                 if (patched!=before){
                     changes++;
-                    stdout.println("[*] Forms match/replace: response string \""+oldV+"\" -> \""+newV+"\"");
+                    debug("[*] Forms match/replace: response string \""+oldV+"\" -> \""+newV+"\"");
                 }
             }catch(IOException ioe){
                 stdout.println("[!] Forms match/replace: failed to encode replacement for \""+oldV+"\"");
             }
         }
         if (hasEnabledIntResponseRule()){
-            stdout.println("[*] Forms match/replace: integer rules are not applied to responses (skipped).");
+            debug("[*] Forms match/replace: integer rules are not applied to responses (skipped).");
         }
         if (changes==0){
             return null;
@@ -472,6 +483,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
     private void loadMatchReplaceSettings(){
         try{
             matchReplaceEnabled="true".equals(callbacks.loadExtensionSetting(MR_ENABLED_SETTING));
+            debugEnabled="true".equals(callbacks.loadExtensionSetting(DEBUG_SETTING));
             String data=callbacks.loadExtensionSetting(MR_RULES_SETTING);
             mrRules.clear();
             if (data!=null && !data.isEmpty()){
@@ -503,6 +515,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             }
             callbacks.saveExtensionSetting(MR_RULES_SETTING, sb.toString());
             callbacks.saveExtensionSetting(MR_ENABLED_SETTING, matchReplaceEnabled?"true":"false");
+            callbacks.saveExtensionSetting(DEBUG_SETTING, debugEnabled?"true":"false");
         }catch(Exception e){
             stdout.println("[!] Failed to save match/replace settings: "+e);
         }
@@ -535,13 +548,13 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
 
         byte[] handshakeBody=Arrays.copyOfRange(msg, rInfo.getBodyOffset(), rInfo.getBodyOffset() + 4);
         if (Arrays.equals(handshakeBody, new byte[] {0x47, 0x44, 0x61, 0x79} )){ // We don't care about the intial handshake
-            stdout.println("Ignoring handshake in HTTP Listener");
+            debug("Ignoring handshake in HTTP Listener");
             return;
         }
 
         byte[] handshakeBody1=Arrays.copyOfRange(msg, rInfo.getBodyOffset(), rInfo.getBodyOffset() + 8);
         if (Arrays.equals(handshakeBody1, new byte[] {0x4e, 0x55, 0x4c, 0x4c, 0x50, 0x4f, 0x53, 0x54} )){ // We don't care about NULLPOSTs
-            stdout.println("Ignoring NULLPOST in HTTP Listener");
+            debug("Ignoring NULLPOST in HTTP Listener");
             return;
         }
 
@@ -577,7 +590,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     messageInfo.setRequest(helpers.buildHttpMessage(rInfo.getHeaders(), newBody));
                     stdout.println("[*] Forms match/replace applied to request");
                 }else{
-                    stdout.println("[*] Forms match/replace: no request rule matched this message");
+                    debug("[*] Forms match/replace: no request rule matched this message");
                 }
             }catch(RuntimeException re){
                 stdout.println("[!] Forms match/replace request error, left unchanged: "+re);
@@ -715,7 +728,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     txtInput.setText(sb.toString().getBytes());
                     txtInput.setEditable(false);
                 }catch(EOFException eofe){
-                    stdout.println("\nReached EOFin setMessage()");
+                    debug("\nReached EOFin setMessage()");
                 }catch(IOException e){
                     stdout.println("Message IOException");
                     e.printStackTrace(stdout);
@@ -755,7 +768,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     txtInput.setText(dummyRequest);
                     txtInput.setEditable(editable);
                 }catch(EOFException eofe){
-                    stdout.println("\nReached EOFin setMessage()");
+                    debug("\nReached EOFin setMessage()");
                 }catch(IOException e){
                     stdout.println("Message IOException");
                     e.printStackTrace(stdout);
@@ -775,7 +788,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         {
 
             PrintWriter stdout = new PrintWriter(callbacks.getStdout(), true);
-            stdout.println("[*] Setting message from dummy POST");
+            debug("[*] Setting message from dummy POST");
 
             IRequestInfo dummyRequest=helpers.analyzeRequest(txtInput.getText());
             HashMap<String,String> paramStrings=new HashMap<String,String>(); // Not necessarily optimal, but code is nicer...
@@ -783,10 +796,10 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             ArrayList<String> invalidInts=new ArrayList<String>();
             for (IParameter p: dummyRequest.getParameters()){
                 if (p.getName().startsWith("string_")){
-                    stdout.println("[+] Found string parameter: "+p.getName()+"="+p.getValue().toString());
+                    debug("[+] Found string parameter: "+p.getName()+"="+p.getValue().toString());
                     paramStrings.put(p.getName(), helpers.urlDecode(p.getValue()));
                 }else if(p.getName().startsWith("int_")){
-                    stdout.println("[+] Found int parameter: "+p.getName()+"="+p.getValue().toString());
+                    debug("[+] Found int parameter: "+p.getName()+"="+p.getValue().toString());
                     try{
                         paramInts.put(p.getName(), Integer.parseInt(p.getValue().trim()));
                     }catch(NumberFormatException nfe){
@@ -858,23 +871,23 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             FormsDispatcher dispatcher=new FormsDispatcher();
             boolean serialisationFailed=false;
             try{
-                stdout.println("[*] Enter stream parser");
+                debug("[*] Enter stream parser");
                 while((m=Message.readDetails(dis,as))!=null){
-                    stdout.println("[*] Message start, ID: "+m_id+ " size: "+m.size());
+                    debug("[*] Message start, ID: "+m_id+ " size: "+m.size());
                     // Apply edits recursively so strings/ints nested inside other
                     // Message objects are updated too, not just top-level ones.
                     // Only genuinely changed values are re-set (see applyEdits).
                     applyEdits(m, "_"+m_id, paramStrings, paramInts, stdout);
                     int resolved=resolveIndexTags(m);
                     if (resolved>0){
-                        stdout.println("[*] Resolved "+resolved+" IndexTag reference(s) before writing message "+m_id);
+                        debug("[*] Resolved "+resolved+" IndexTag reference(s) before writing message "+m_id);
                     }
                     m.writeDetails(dispatcher, dos);
                     m_id++;
                 }
 
             }catch(EOFException eofe){
-                stdout.println("\nReached EOF in getMessage()");
+                debug("\nReached EOF in getMessage()");
             }catch(IOException e){
                 stdout.println("Message IOException");
                 e.printStackTrace(stdout);
@@ -1012,7 +1025,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             ArrayList<Message> messages=new ArrayList<Message>();
             
             while((m=Message.readDetails(dis,as))!=null){
-                stdout.println("Adding message as potential insertion point");
+                debug("Adding message as potential insertion point");
                 messages.add(m);
             }
             for (int i=0;i<messages.size();i++){
@@ -1024,13 +1037,13 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 }
             }
         }catch(EOFException eofe){
-                stdout.println("\nReached EOF in getInsertionPoints()");
+                debug("\nReached EOF in getInsertionPoints()");
         }catch(IOException e){
             stdout.println("Scanner Message IOException");
         }catch(IllegalArgumentException iae){
             stdout.println("Scanner Message IllegalArgumentException");
         }
-        stdout.println("Supplied "+insertionPoints.size()+" insertion points");
+        debug("Supplied "+insertionPoints.size()+" insertion points");
         return insertionPoints;
     }
     class OracleFormsInsertionPoint implements IScannerInsertionPoint{
@@ -1060,7 +1073,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         @Override
         public byte[] buildRequest(byte[] payload) {
             
-            stdout.println("buildRequest called");
+            debug("buildRequest called");
             IRequestInfo rInfo=helpers.analyzeRequest(this.baseRequest);
             //messages.get(msgId).setValueAt(propId, new String(payload));
 
@@ -1078,7 +1091,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     m.writeDetails(dispatcher, dos); // single dispatcher: keep the string table in sync across the stream
                 }
             }catch(EOFException eofe){
-                stdout.println("\nReached EOF in buildRequest");
+                debug("\nReached EOF in buildRequest");
             }catch(IOException ioe){
                 stdout.println("IOExceltion while building scanner request!");
                 ioe.printStackTrace(stdout);
@@ -1094,7 +1107,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 return null;
             }
             byte[] res=baos.toByteArray();
-            stdout.println("Scanner request built: "+byteArrayToHex(res));
+            debug("Scanner request built: "+byteArrayToHex(res));
             return helpers.buildHttpMessage(rInfo.getHeaders(), baos.toByteArray());
         }
 
@@ -1105,7 +1118,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
 
         @Override
         public byte getInsertionPointType() {
-            stdout.println("Insertion Point Type queried");
+            debug("Insertion Point Type queried");
             return INS_PARAM_BODY;
         }
 
@@ -1121,6 +1134,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         OracleFormsMatchReplaceTab(){
             panel=new javax.swing.JPanel(new java.awt.BorderLayout());
 
+            // Options panel (vertical): each checkbox writes its flag + persists.
             final javax.swing.JCheckBox master=new javax.swing.JCheckBox("Enable Oracle Forms match/replace", matchReplaceEnabled);
             master.addActionListener(new java.awt.event.ActionListener(){
                 public void actionPerformed(java.awt.event.ActionEvent e){
@@ -1128,8 +1142,18 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     saveMatchReplaceSettings();
                 }
             });
-            javax.swing.JPanel top=new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT));
+            final javax.swing.JCheckBox debugBox=new javax.swing.JCheckBox("Show debug output in extension output", debugEnabled);
+            debugBox.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){
+                    debugEnabled=debugBox.isSelected();
+                    saveMatchReplaceSettings();
+                }
+            });
+            javax.swing.JPanel top=new javax.swing.JPanel();
+            top.setLayout(new javax.swing.BoxLayout(top, javax.swing.BoxLayout.Y_AXIS));
+            top.setBorder(javax.swing.BorderFactory.createTitledBorder("Options"));
             top.add(master);
+            top.add(debugBox);
             panel.add(top, java.awt.BorderLayout.NORTH);
 
             model=new MRTableModel();
