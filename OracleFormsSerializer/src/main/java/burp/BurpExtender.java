@@ -85,7 +85,31 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         }
         return ret.toString();
     }
-    
+
+    // Message.readDetails() leaves string-table back-references as
+    // oracle.forms.engine.IndexTag placeholders instead of resolving them to
+    // String objects. Message.writeDetails() cannot serialise an IndexTag and
+    // throws "Attempt to write out an object of type oracle.forms.engine.IndexTag".
+    // Before re-serialising we walk the whole tree and replace every IndexTag
+    // with the concrete string it resolves to (IndexTag.toString() yields that
+    // string). The single shared FormsDispatcher then rebuilds proper
+    // back-references on the way out.
+    private int resolveIndexTags(Message m){
+        int resolved=0;
+        for (int i=0;i<m.size();i++){
+            Object v=m.getValueAt(i);
+            if (v==null){
+                continue;
+            }
+            if (v instanceof Message){
+                resolved+=resolveIndexTags((Message)v); // nested message
+            }else if ("oracle.forms.engine.IndexTag".equals(v.getClass().getName())){
+                m.setValueAt(i, v.toString());
+                resolved++;
+            }
+        }
+        return resolved;
+    }
 
     @Override
     public void processHttpMessage(int toolFlag, boolean messageIsRequest, IHttpRequestResponse messageInfo){
@@ -284,6 +308,16 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             ByteArrayOutputStream baos=new ByteArrayOutputStream();
             DataOutputStream dos=new DataOutputStream(baos);
             Message m;
+            // The Forms string table (the shared `as` array on the read side)
+            // accumulates across EVERY message in the stream: repeated strings
+            // are sent as 1-byte back-references into it. The write side keeps
+            // its mirror of that table inside a single FormsDispatcher, so the
+            // dispatcher must also live for the whole stream. A fresh dispatcher
+            // per message resets the table and desynchronises multi-message
+            // streams, yielding a corrupt stream. It only worked before because
+            // the messages here are short.
+            FormsDispatcher dispatcher=new FormsDispatcher();
+            boolean serialisationFailed=false;
             try{
                 stdout.println("[*] Enter stream parser");
                 while((m=Message.readDetails(dis,as))!=null){
@@ -293,27 +327,47 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                         if (m.getPropertyTypeAt(i) == 1){
                             String stringKey=String.format("string_%d_%d",m_id,i);
                             if (paramStrings.containsKey(stringKey)){
-                                stdout.println("[+] Setting String value for "+stringKey);
-                                m.setValueAt(i, paramStrings.get(stringKey));
+                                String newVal=paramStrings.get(stringKey);
+                                Object origVal=m.getValueAt(i);
+                                // Only touch values the user actually changed.
+                                if (origVal==null || !newVal.equals(origVal.toString())){
+                                    stdout.println("[+] Setting String value for "+stringKey);
+                                    m.setValueAt(i, newVal);
+                                }
                             }
                         }
                         else if (m.getPropertyTypeAt(i) == 3){
                             String intKey=String.format("int_%d_%d",m_id,i);
                             if (paramInts.containsKey(intKey)){
-                                stdout.println("[+] Setting Integer value for "+intKey);
-                                m.setValueAt(i, paramInts.get(intKey));
+                                Integer newVal=paramInts.get(intKey);
+                                Object origVal=m.getValueAt(i);
+                                if (origVal==null || !newVal.toString().equals(origVal.toString())){
+                                    stdout.println("[+] Setting Integer value for "+intKey);
+                                    m.setValueAt(i, newVal);
+                                }
                             }
                         }
                     }
-                    m.writeDetails(new FormsDispatcher(), dos);
+                    resolveIndexTags(m);
+                    m.writeDetails(dispatcher, dos);
                     m_id++;
                 }
-                
+
             }catch(EOFException eofe){
                 stdout.println("\nReached EOF in getMessage()");
             }catch(IOException e){
                 stdout.println("Message IOException");
                 e.printStackTrace(stdout);
+            }catch(RuntimeException re){
+                // e.g. an IndexTag that could not be resolved. Rather than hand
+                // Burp a truncated/corrupt body, forward the original message
+                // untouched and make the failure visible.
+                stdout.println("[!] Re-serialisation failed at message "+m_id+", forwarding original message unchanged:");
+                re.printStackTrace(stdout);
+                serialisationFailed=true;
+            }
+            if (serialisationFailed){
+                return currentMessage;
             }
             try{
                 dos.writeByte(-16);
@@ -411,13 +465,15 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             ByteArrayOutputStream baos=new ByteArrayOutputStream();
             DataOutputStream dos=new DataOutputStream(baos);
             
+            FormsDispatcher dispatcher=new FormsDispatcher();
             try{
                 for (int i=0;i<messages.size();i++){
                     Message m=messages.get(i);
                     if (i == msgId){
                         m.setValueAt(propId, new String(payload));
                     }
-                    m.writeDetails(new FormsDispatcher(), dos);
+                    resolveIndexTags(m); // convert string-table back-references so writeDetails can serialise them
+                    m.writeDetails(dispatcher, dos); // single dispatcher: keep the string table in sync across the stream
                 }
             }catch(EOFException eofe){
                 stdout.println("\nReached EOF in buildRequest");
