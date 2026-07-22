@@ -3,8 +3,14 @@ package burp;
 import java.awt.Component;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
@@ -33,7 +39,13 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
     private int[] respSeedBuf=null;
     private int[] respIndexVars=null;
     private static String[] as=new String[256];
-    
+
+    // Automatic match/replace state.
+    private final CopyOnWriteArrayList<MatchReplaceRule> mrRules=new CopyOnWriteArrayList<MatchReplaceRule>();
+    private volatile boolean matchReplaceEnabled=false;
+    private static final String MR_RULES_SETTING="oracle_forms_mr_rules";
+    private static final String MR_ENABLED_SETTING="oracle_forms_mr_enabled";
+
     @Override
     public void registerExtenderCallbacks(IBurpExtenderCallbacks callbacks)
     {   
@@ -51,6 +63,10 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         callbacks.registerMessageEditorTabFactory(this);
         callbacks.registerScannerInsertionPointProvider(this);
         callbacks.registerHttpListener(this);
+
+        // Automatic match/replace: restore persisted rules and add the config tab.
+        loadMatchReplaceSettings();
+        callbacks.addSuiteTab(new OracleFormsMatchReplaceTab());
     }
     
     public boolean gotKey(){
@@ -200,6 +216,304 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     }
                 }
             }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Automatic match/replace for Forms string/integer values.
+    // ---------------------------------------------------------------------
+
+    static class MatchReplaceRule {
+        boolean enabled=true;
+        boolean isString=true; // true=String (regex), false=Integer (exact value)
+        String scope="both";   // "request" | "response" | "both"
+        String match="";
+        String replace="";
+
+        MatchReplaceRule(){}
+        MatchReplaceRule(boolean enabled, boolean isString, String scope, String match, String replace){
+            this.enabled=enabled;
+            this.isString=isString;
+            this.scope=scope;
+            this.match=match;
+            this.replace=replace;
+        }
+        boolean appliesTo(boolean request){
+            if (!enabled){
+                return false;
+            }
+            if ("both".equals(scope)){
+                return true;
+            }
+            return request ? "request".equals(scope) : "response".equals(scope);
+        }
+    }
+
+    private boolean hasApplicableRules(boolean request){
+        if (!matchReplaceEnabled){
+            return false;
+        }
+        for (MatchReplaceRule r: mrRules){
+            if (r.appliesTo(request)){
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasEnabledIntResponseRule(){
+        for (MatchReplaceRule r: mrRules){
+            if (!r.isString && r.appliesTo(false)){
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Apply every in-scope enabled String (regex) rule to a value, in order.
+    private String applyStringRules(String value, boolean request){
+        if (value==null){
+            return null;
+        }
+        String out=value;
+        for (MatchReplaceRule r: mrRules){
+            if (!r.isString || !r.appliesTo(request)){
+                continue;
+            }
+            try{
+                out=Pattern.compile(r.match).matcher(out).replaceAll(r.replace);
+            }catch(PatternSyntaxException pse){
+                stdout.println("[!] Invalid regex in match/replace rule (\""+r.match+"\"), skipping: "+pse.getMessage());
+            }catch(RuntimeException rte){
+                stdout.println("[!] match/replace rule failed for \""+r.match+"\": "+rte);
+            }
+        }
+        return out;
+    }
+
+    // Apply in-scope enabled Integer (exact) rules; returns the replacement for
+    // the first matching rule, otherwise the original value.
+    private int applyIntRules(int value, boolean request){
+        for (MatchReplaceRule r: mrRules){
+            if (r.isString || !r.appliesTo(request)){
+                continue;
+            }
+            try{
+                if (Integer.parseInt(r.match.trim())==value){
+                    return Integer.parseInt(r.replace.trim());
+                }
+            }catch(NumberFormatException nfe){
+                stdout.println("[!] Invalid integer in match/replace rule (match=\""+r.match+"\", replace=\""+r.replace+"\"), skipping");
+            }
+        }
+        return value;
+    }
+
+    // Recursively apply request-scope rules to a message's string/int leaves,
+    // descending into nested Messages. Returns the number of values changed.
+    private int applyMatchReplaceToMessage(Message m){
+        int changes=0;
+        for (int i=0;i<m.size();i++){
+            Object v=m.getValueAt(i);
+            if (v instanceof Message){
+                changes+=applyMatchReplaceToMessage((Message)v);
+            }else if (v!=null && m.getPropertyTypeAt(i)==1){
+                String orig=v.toString();
+                String repl=applyStringRules(orig, true);
+                if (repl!=null && !repl.equals(orig)){
+                    m.setValueAt(i, repl);
+                    changes++;
+                }
+            }else if (v!=null && m.getPropertyTypeAt(i)==3){
+                try{
+                    int iv=Integer.parseInt(v.toString());
+                    int repl=applyIntRules(iv, true);
+                    if (repl!=iv){
+                        m.setValueAt(i, Integer.valueOf(repl));
+                        changes++;
+                    }
+                }catch(NumberFormatException nfe){}
+            }
+        }
+        return changes;
+    }
+
+    // Collect the distinct string values present anywhere in a message tree.
+    private void collectStringValues(Message m, Set<String> out){
+        for (int i=0;i<m.size();i++){
+            Object v=m.getValueAt(i);
+            if (v==null){
+                continue;
+            }
+            if (v instanceof Message){
+                collectStringValues((Message)v, out);
+            }else if (m.getPropertyTypeAt(i)==1){
+                out.add(v.toString());
+            }
+        }
+    }
+
+    // Requests can be re-serialised: apply rules to the parsed messages and
+    // re-encode with one shared dispatcher. Returns the new body, or null if
+    // nothing changed / re-serialisation failed (leave the request untouched).
+    private byte[] transformRequestBody(byte[] body){
+        String[] localAs=new String[256];
+        ByteArrayInputStream bis=new ByteArrayInputStream(body);
+        DataInputStream dis=new DataInputStream(bis);
+        ByteArrayOutputStream baos=new ByteArrayOutputStream();
+        DataOutputStream dos=new DataOutputStream(baos);
+        FormsDispatcher dispatcher=new FormsDispatcher();
+        Message m;
+        int totalChanges=0;
+        try{
+            while((m=Message.readDetails(dis,localAs))!=null){
+                totalChanges+=applyMatchReplaceToMessage(m);
+                resolveIndexTags(m);
+                m.writeDetails(dispatcher, dos);
+            }
+        }catch(EOFException eofe){
+            // normal-ish end of stream
+        }catch(IOException e){
+            stdout.println("[!] Forms match/replace request IOException, leaving unchanged: "+e);
+            return null;
+        }catch(RuntimeException re){
+            stdout.println("[!] Forms match/replace request re-serialisation failed, leaving unchanged: "+re);
+            return null;
+        }
+        if (totalChanges==0){
+            return null;
+        }
+        try{
+            dos.writeByte(-16);
+            dos.writeByte(0x01);
+        }catch(IOException e){
+            return null;
+        }
+        return baos.toByteArray();
+    }
+
+    // Responses cannot be re-serialised (see patchResponse()). Apply string
+    // rules by byte-patching each changed literal in place. Returns the new
+    // body, or null if nothing changed.
+    private byte[] transformResponseBody(byte[] body){
+        Set<String> values=new LinkedHashSet<String>();
+        String[] localAs=new String[256];
+        try{
+            ByteArrayInputStream bis=new ByteArrayInputStream(body);
+            DataInputStream dis=new DataInputStream(bis);
+            Message m;
+            while((m=Message.readDetails(dis,localAs))!=null){
+                collectStringValues(m, values);
+            }
+        }catch(EOFException eofe){
+            // normal-ish end of stream
+        }catch(Exception e){
+            stdout.println("[!] Forms match/replace: failed to parse response, leaving unchanged: "+e);
+            return null;
+        }
+        byte[] patched=body;
+        int changes=0;
+        for (String oldV: values){
+            String newV=applyStringRules(oldV, false);
+            if (newV==null || newV.equals(oldV)){
+                continue;
+            }
+            try{
+                byte[] before=patched;
+                patched=replaceAll(patched, utfBytes(oldV), utfBytes(newV));
+                if (patched!=before){
+                    changes++;
+                    stdout.println("[*] Forms match/replace: response string \""+oldV+"\" -> \""+newV+"\"");
+                }
+            }catch(IOException ioe){
+                stdout.println("[!] Forms match/replace: failed to encode replacement for \""+oldV+"\"");
+            }
+        }
+        if (hasEnabledIntResponseRule()){
+            stdout.println("[*] Forms match/replace: integer rules are not applied to responses (skipped).");
+        }
+        if (changes==0){
+            return null;
+        }
+        return patched;
+    }
+
+    // Replace every non-overlapping occurrence of needle with rep. Returns the
+    // same array reference if needle is absent (so callers can detect no-op).
+    static byte[] replaceAll(byte[] hay, byte[] needle, byte[] rep){
+        int idx=indexOf(hay, needle, 0);
+        if (idx<0){
+            return hay;
+        }
+        ByteArrayOutputStream out=new ByteArrayOutputStream();
+        int pos=0;
+        while (idx>=0){
+            out.write(hay, pos, idx-pos);
+            out.write(rep, 0, rep.length);
+            pos=idx+needle.length;
+            idx=indexOf(hay, needle, pos);
+        }
+        out.write(hay, pos, hay.length-pos);
+        return out.toByteArray();
+    }
+
+    private static String getHeaderValue(List<String> headers, String name){
+        for (String h: headers){
+            int c=h.indexOf(':');
+            if (c>0 && h.substring(0,c).trim().equalsIgnoreCase(name)){
+                return h.substring(c+1).trim();
+            }
+        }
+        return null;
+    }
+
+    private void loadMatchReplaceSettings(){
+        try{
+            matchReplaceEnabled="true".equals(callbacks.loadExtensionSetting(MR_ENABLED_SETTING));
+            String data=callbacks.loadExtensionSetting(MR_RULES_SETTING);
+            mrRules.clear();
+            if (data!=null && !data.isEmpty()){
+                for (String line: data.split("\n")){
+                    if (line.trim().isEmpty()){
+                        continue;
+                    }
+                    String[] f=line.split("\\|", -1);
+                    if (f.length!=5){
+                        continue;
+                    }
+                    mrRules.add(new MatchReplaceRule("1".equals(f[0]), "1".equals(f[1]), b64d(f[2]), b64d(f[3]), b64d(f[4])));
+                }
+            }
+        }catch(Exception e){
+            stdout.println("[!] Failed to load match/replace settings: "+e);
+        }
+    }
+
+    void saveMatchReplaceSettings(){
+        try{
+            StringBuilder sb=new StringBuilder();
+            for (MatchReplaceRule r: mrRules){
+                sb.append(r.enabled?"1":"0").append("|")
+                  .append(r.isString?"1":"0").append("|")
+                  .append(b64e(r.scope)).append("|")
+                  .append(b64e(r.match)).append("|")
+                  .append(b64e(r.replace)).append("\n");
+            }
+            callbacks.saveExtensionSetting(MR_RULES_SETTING, sb.toString());
+            callbacks.saveExtensionSetting(MR_ENABLED_SETTING, matchReplaceEnabled?"true":"false");
+        }catch(Exception e){
+            stdout.println("[!] Failed to save match/replace settings: "+e);
+        }
+    }
+
+    private static String b64e(String s){
+        return Base64.getEncoder().encodeToString(s==null ? new byte[0] : s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+    private static String b64d(String s){
+        try{
+            return new String(Base64.getDecoder().decode(s), java.nio.charset.StandardCharsets.UTF_8);
+        }catch(Exception e){
+            return "";
         }
     }
 
@@ -739,6 +1053,176 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             stdout.println("Insertion Point Type queried");
             return INS_PARAM_BODY;
         }
-        
+
+    }
+
+    // Config UI for automatic match/replace. A Burp suite tab with a rule
+    // table, an Add/Edit dialog, and a master on/off switch. Rules persist via
+    // saveExtensionSetting()/loadExtensionSetting().
+    class OracleFormsMatchReplaceTab implements ITab {
+        private final javax.swing.JPanel panel;
+        private final MRTableModel model;
+
+        OracleFormsMatchReplaceTab(){
+            panel=new javax.swing.JPanel(new java.awt.BorderLayout());
+
+            final javax.swing.JCheckBox master=new javax.swing.JCheckBox("Enable Oracle Forms match/replace", matchReplaceEnabled);
+            master.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){
+                    matchReplaceEnabled=master.isSelected();
+                    saveMatchReplaceSettings();
+                }
+            });
+            javax.swing.JPanel top=new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT));
+            top.add(master);
+            panel.add(top, java.awt.BorderLayout.NORTH);
+
+            model=new MRTableModel();
+            final javax.swing.JTable table=new javax.swing.JTable(model);
+            table.setFillsViewportHeight(true);
+            panel.add(new javax.swing.JScrollPane(table), java.awt.BorderLayout.CENTER);
+
+            javax.swing.JPanel buttons=new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT));
+            javax.swing.JButton add=new javax.swing.JButton("Add");
+            javax.swing.JButton edit=new javax.swing.JButton("Edit");
+            javax.swing.JButton remove=new javax.swing.JButton("Remove");
+            buttons.add(add);
+            buttons.add(edit);
+            buttons.add(remove);
+            panel.add(buttons, java.awt.BorderLayout.SOUTH);
+
+            add.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){
+                    MatchReplaceRule r=editRuleDialog(new MatchReplaceRule(true, true, "both", "", ""));
+                    if (r!=null){
+                        mrRules.add(r);
+                        model.fireTableDataChanged();
+                        saveMatchReplaceSettings();
+                    }
+                }
+            });
+            edit.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){
+                    int row=table.getSelectedRow();
+                    if (row<0 || row>=mrRules.size()){
+                        return;
+                    }
+                    MatchReplaceRule cur=mrRules.get(row);
+                    MatchReplaceRule r=editRuleDialog(new MatchReplaceRule(cur.enabled, cur.isString, cur.scope, cur.match, cur.replace));
+                    if (r!=null){
+                        mrRules.set(row, r);
+                        model.fireTableDataChanged();
+                        saveMatchReplaceSettings();
+                    }
+                }
+            });
+            remove.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){
+                    int row=table.getSelectedRow();
+                    if (row<0 || row>=mrRules.size()){
+                        return;
+                    }
+                    mrRules.remove(row);
+                    model.fireTableDataChanged();
+                    saveMatchReplaceSettings();
+                }
+            });
+
+            callbacks.customizeUiComponent(panel);
+        }
+
+        @Override
+        public String getTabCaption(){
+            return "Oracle Forms M/R";
+        }
+
+        @Override
+        public Component getUiComponent(){
+            return panel;
+        }
+
+        // Modal Add/Edit dialog. Returns the edited rule, or null if cancelled
+        // or the input was invalid and the user gave up.
+        private MatchReplaceRule editRuleDialog(MatchReplaceRule seed){
+            javax.swing.JComboBox<String> type=new javax.swing.JComboBox<String>(new String[]{"String (regex)","Integer (exact)"});
+            type.setSelectedIndex(seed.isString?0:1);
+            javax.swing.JComboBox<String> scope=new javax.swing.JComboBox<String>(new String[]{"both","request","response"});
+            scope.setSelectedItem(seed.scope);
+            javax.swing.JTextField match=new javax.swing.JTextField(seed.match, 24);
+            javax.swing.JTextField replace=new javax.swing.JTextField(seed.replace, 24);
+            javax.swing.JCheckBox enabled=new javax.swing.JCheckBox("Enabled", seed.enabled);
+
+            javax.swing.JPanel form=new javax.swing.JPanel(new java.awt.GridLayout(0,2,4,4));
+            form.add(new javax.swing.JLabel("Type:"));
+            form.add(type);
+            form.add(new javax.swing.JLabel("Scope:"));
+            form.add(scope);
+            form.add(new javax.swing.JLabel("Match (regex for String):"));
+            form.add(match);
+            form.add(new javax.swing.JLabel("Replace:"));
+            form.add(replace);
+            form.add(new javax.swing.JLabel(""));
+            form.add(enabled);
+
+            while (true){
+                int res=javax.swing.JOptionPane.showConfirmDialog(panel, form, "Match/Replace rule",
+                        javax.swing.JOptionPane.OK_CANCEL_OPTION, javax.swing.JOptionPane.PLAIN_MESSAGE);
+                if (res!=javax.swing.JOptionPane.OK_OPTION){
+                    return null;
+                }
+                boolean isString=type.getSelectedIndex()==0;
+                String matchVal=match.getText();
+                String replaceVal=replace.getText();
+                if (isString){
+                    try{
+                        Pattern.compile(matchVal);
+                    }catch(PatternSyntaxException pse){
+                        javax.swing.JOptionPane.showMessageDialog(panel, "Invalid regular expression:\n"+pse.getMessage(),
+                                "Invalid regex", javax.swing.JOptionPane.ERROR_MESSAGE);
+                        continue;
+                    }
+                }else{
+                    try{
+                        Integer.parseInt(matchVal.trim());
+                        Integer.parseInt(replaceVal.trim());
+                    }catch(NumberFormatException nfe){
+                        javax.swing.JOptionPane.showMessageDialog(panel, "Integer rules need whole numbers in both Match and Replace.",
+                                "Invalid integer", javax.swing.JOptionPane.ERROR_MESSAGE);
+                        continue;
+                    }
+                }
+                return new MatchReplaceRule(enabled.isSelected(), isString, (String)scope.getSelectedItem(), matchVal, replaceVal);
+            }
+        }
+
+        class MRTableModel extends javax.swing.table.AbstractTableModel {
+            private final String[] cols={"Enabled","Type","Scope","Match","Replace"};
+            @Override public int getRowCount(){ return mrRules.size(); }
+            @Override public int getColumnCount(){ return cols.length; }
+            @Override public String getColumnName(int c){ return cols[c]; }
+            @Override public Class<?> getColumnClass(int c){ return c==0 ? Boolean.class : String.class; }
+            @Override public boolean isCellEditable(int r, int c){ return c==0; }
+            @Override public Object getValueAt(int r, int c){
+                if (r<0 || r>=mrRules.size()){
+                    return null;
+                }
+                MatchReplaceRule rule=mrRules.get(r);
+                switch(c){
+                    case 0: return rule.enabled;
+                    case 1: return rule.isString?"String (regex)":"Integer";
+                    case 2: return rule.scope;
+                    case 3: return rule.match;
+                    case 4: return rule.replace;
+                }
+                return null;
+            }
+            @Override public void setValueAt(Object val, int r, int c){
+                if (c==0 && r>=0 && r<mrRules.size()){
+                    mrRules.get(r).enabled=Boolean.TRUE.equals(val);
+                    saveMatchReplaceSettings();
+                    fireTableRowsUpdated(r, r);
+                }
+            }
+        }
     }
 }
