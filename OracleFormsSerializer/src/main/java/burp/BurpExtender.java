@@ -90,10 +90,12 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
     // oracle.forms.engine.IndexTag placeholders instead of resolving them to
     // String objects. Message.writeDetails() cannot serialise an IndexTag and
     // throws "Attempt to write out an object of type oracle.forms.engine.IndexTag".
-    // Before re-serialising we walk the whole tree and replace every IndexTag
-    // with the concrete string it resolves to (IndexTag.toString() yields that
-    // string). The single shared FormsDispatcher then rebuilds proper
-    // back-references on the way out.
+    // Responses (unlike short requests) are full of these references, including
+    // inside nested Messages, so before re-serialising we walk the whole tree
+    // and replace every IndexTag with the concrete string it resolves to
+    // (IndexTag.toString() yields that string, which is why the read-only dump
+    // shows correct values). The single shared FormsDispatcher then rebuilds
+    // proper back-references on the way out.
     private int resolveIndexTags(Message m){
         int resolved=0;
         for (int i=0;i<m.size();i++){
@@ -113,8 +115,9 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
 
     // On-the-wire bytes of a String literal in the Forms stream: a 2-byte
     // big-endian length followed by the modified-UTF-8 bytes, exactly as
-    // DataOutput.writeUTF() (readDetails reads them with readUTF). We use this
-    // to find and replace a literal in the raw body without re-serialising.
+    // DataOutput.writeUTF() (readDetails reads them with readUTF, which is why
+    // plain string literals already round-trip for requests). We use this to
+    // find and replace a literal in the raw body without re-serialising.
     static byte[] utfBytes(String s) throws IOException {
         ByteArrayOutputStream b=new ByteArrayOutputStream();
         DataOutputStream d=new DataOutputStream(b);
@@ -138,6 +141,66 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             return i;
         }
         return -1;
+    }
+
+    // Recursively collect every editable String (type 1) and Integer (type 3)
+    // leaf under `m`, keyed by its full path so values nested inside other
+    // Message objects are addressable too: e.g. string_49_3_2 means message 49
+    // -> property 3 (a nested Message) -> property 2 (a String). `prefix` is the
+    // accumulated "_<index>" path of the parents, starting as "_<messageId>" at
+    // the top level. Keys stay backward compatible: a top-level string at
+    // message 12 property 5 is still string_12_5.
+    private void collectStrings(Message m, String prefix,
+                               java.util.Map<String,String> strings,
+                               java.util.Map<String,Integer> ints){
+        for (int i=0;i<m.size();i++){
+            Object v=m.getValueAt(i);
+            if (v==null){
+                continue;
+            }
+            if (v instanceof Message){
+                collectStrings((Message)v, prefix+"_"+i, strings, ints); // descend into nested Message
+            }else if (m.getPropertyTypeAt(i)==1){
+                strings.put("string"+prefix+"_"+i, v.toString());
+            }else if (m.getPropertyTypeAt(i)==3){
+                try{
+                    ints.put("int"+prefix+"_"+i, Integer.valueOf(v.toString()));
+                }catch(NumberFormatException nfe){}
+            }
+        }
+    }
+
+    // Mirror of collectStrings for the write side: walk the same message tree
+    // with the same key scheme and push edited values back onto it via
+    // setValueAt, descending into nested Messages. Only values the user
+    // actually changed are written, to avoid needless re-encoding.
+    private void applyEdits(Message m, String prefix,
+                           java.util.Map<String,String> paramStrings,
+                           java.util.Map<String,Integer> paramInts, PrintWriter stdout){
+        for (int i=0;i<m.size();i++){
+            Object v=m.getValueAt(i);
+            if (v instanceof Message){
+                applyEdits((Message)v, prefix+"_"+i, paramStrings, paramInts, stdout); // descend into nested Message
+            }else if (m.getPropertyTypeAt(i)==1){
+                String key="string"+prefix+"_"+i;
+                if (paramStrings.containsKey(key)){
+                    String newVal=paramStrings.get(key);
+                    if (v==null || !newVal.equals(v.toString())){
+                        stdout.println("[+] Setting String value for "+key);
+                        m.setValueAt(i, newVal);
+                    }
+                }
+            }else if (m.getPropertyTypeAt(i)==3){
+                String key="int"+prefix+"_"+i;
+                if (paramInts.containsKey(key)){
+                    Integer newVal=paramInts.get(key);
+                    if (v==null || !newVal.toString().equals(v.toString())){
+                        stdout.println("[+] Setting Integer value for "+key);
+                        m.setValueAt(i, newVal);
+                    }
+                }
+            }
+        }
     }
 
     @Override
@@ -304,21 +367,20 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 int m_id=0;
 
                 try{
+                    // Expose strings/ints nested inside other Message objects
+                    // too, for both requests and responses. getMessage() applies
+                    // the same recursive keys back onto the message tree.
+                    java.util.LinkedHashMap<String,String> strings=new java.util.LinkedHashMap<String,String>();
+                    java.util.LinkedHashMap<String,Integer> ints=new java.util.LinkedHashMap<String,Integer>();
                     while((m=Message.readDetails(dis,as))!=null){
-                        for (int i=0;i<m.size();i++){
-                            IParameter param;
-                            switch(m.getPropertyTypeAt(i)){
-                                case 1: // String
-                                    param=helpers.buildParameter(String.format("string_%d_%d",m_id,i), helpers.urlEncode(m.getValueAt(i).toString()), IParameter.PARAM_BODY);
-                                    dummyRequest=helpers.addParameter(dummyRequest, param);
-                                    break;
-                                case 3: // Integer
-                                    param=helpers.buildParameter(String.format("int_%d_%d",m_id,i), m.getValueAt(i).toString(), IParameter.PARAM_BODY);
-                                    dummyRequest=helpers.addParameter(dummyRequest, param);
-                                    break;
-                            }
-                        }
+                        collectStrings(m, "_"+m_id, strings, ints);
                         m_id++;
+                    }
+                    for (java.util.Map.Entry<String,String> e: strings.entrySet()){
+                        dummyRequest=helpers.addParameter(dummyRequest, helpers.buildParameter(e.getKey(), helpers.urlEncode(e.getValue()), IParameter.PARAM_BODY));
+                    }
+                    for (java.util.Map.Entry<String,Integer> e: ints.entrySet()){
+                        dummyRequest=helpers.addParameter(dummyRequest, helpers.buildParameter(e.getKey(), e.getValue().toString(), IParameter.PARAM_BODY));
                     }
                     dummyRequest=helpers.addParameter(dummyRequest, helpers.buildParameter("original", byteArrayToHex(body), IParameter.PARAM_BODY));
                     txtInput.setText(dummyRequest);
@@ -394,43 +456,26 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             // accumulates across EVERY message in the stream: repeated strings
             // are sent as 1-byte back-references into it. The write side keeps
             // its mirror of that table inside a single FormsDispatcher, so the
-            // dispatcher must also live for the whole stream. A fresh dispatcher
-            // per message resets the table and desynchronises multi-message
-            // streams, yielding a corrupt stream. It only worked before because
-            // the messages here are short.
+            // dispatcher must also live for the whole stream. A fresh
+            // dispatcher per message resets the table and desynchronises
+            // multi-message streams (i.e. responses), yielding a corrupt stream
+            // that crashes the client and no longer re-deserialises. Requests
+            // only got away with the old per-message dispatcher because they
+            // are short.
             FormsDispatcher dispatcher=new FormsDispatcher();
             boolean serialisationFailed=false;
             try{
                 stdout.println("[*] Enter stream parser");
                 while((m=Message.readDetails(dis,as))!=null){
                     stdout.println("[*] Message start, ID: "+m_id+ " size: "+m.size());
-                    for (int i=0;i<m.size();i++){
-                        stdout.println("[*] Property type at "+i+" is "+m.getPropertyTypeAt(i));
-                        if (m.getPropertyTypeAt(i) == 1){
-                            String stringKey=String.format("string_%d_%d",m_id,i);
-                            if (paramStrings.containsKey(stringKey)){
-                                String newVal=paramStrings.get(stringKey);
-                                Object origVal=m.getValueAt(i);
-                                // Only touch values the user actually changed.
-                                if (origVal==null || !newVal.equals(origVal.toString())){
-                                    stdout.println("[+] Setting String value for "+stringKey);
-                                    m.setValueAt(i, newVal);
-                                }
-                            }
-                        }
-                        else if (m.getPropertyTypeAt(i) == 3){
-                            String intKey=String.format("int_%d_%d",m_id,i);
-                            if (paramInts.containsKey(intKey)){
-                                Integer newVal=paramInts.get(intKey);
-                                Object origVal=m.getValueAt(i);
-                                if (origVal==null || !newVal.toString().equals(origVal.toString())){
-                                    stdout.println("[+] Setting Integer value for "+intKey);
-                                    m.setValueAt(i, newVal);
-                                }
-                            }
-                        }
+                    // Apply edits recursively so strings/ints nested inside other
+                    // Message objects are updated too, not just top-level ones.
+                    // Only genuinely changed values are re-set (see applyEdits).
+                    applyEdits(m, "_"+m_id, paramStrings, paramInts, stdout);
+                    int resolved=resolveIndexTags(m);
+                    if (resolved>0){
+                        stdout.println("[*] Resolved "+resolved+" IndexTag reference(s) before writing message "+m_id);
                     }
-                    resolveIndexTags(m);
                     m.writeDetails(dispatcher, dos);
                     m_id++;
                 }
@@ -442,7 +487,8 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 e.printStackTrace(stdout);
             }catch(RuntimeException re){
                 // e.g. an IndexTag that could not be resolved. Rather than hand
-                // Burp a truncated/corrupt body, forward the original message
+                // Burp a truncated/corrupt body (which crashes the client and
+                // breaks history rendering), forward the original message
                 // untouched and make the failure visible.
                 stdout.println("[!] Re-serialisation failed at message "+m_id+", forwarding original message unchanged:");
                 re.printStackTrace(stdout);
@@ -482,19 +528,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 Message m;
                 int m_id=0;
                 while((m=Message.readDetails(dis,as))!=null){
-                    for (int i=0;i<m.size();i++){
-                        Object v=m.getValueAt(i);
-                        if (v==null){
-                            continue;
-                        }
-                        if (m.getPropertyTypeAt(i)==1){
-                            origStrings.put(String.format("string_%d_%d",m_id,i), v.toString());
-                        }else if (m.getPropertyTypeAt(i)==3){
-                            try{
-                                origInts.put(String.format("int_%d_%d",m_id,i), Integer.valueOf(v.toString()));
-                            }catch(NumberFormatException nfe){}
-                        }
-                    }
+                    collectStrings(m, "_"+m_id, origStrings, origInts); // same recursive keys as the editable surface
                     m_id++;
                 }
             }catch(EOFException eofe){
