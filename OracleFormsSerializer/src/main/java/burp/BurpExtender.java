@@ -1001,8 +1001,18 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                             dummyRequest=helpers.addParameter(dummyRequest, helpers.buildParameter(e.getKey(), e.getValue().toString(), IParameter.PARAM_BODY));
                         }
                     }
-                    dummyRequest=helpers.addParameter(dummyRequest, helpers.buildParameter("original", byteArrayToHex(body), IParameter.PARAM_BODY));
-                    txtInput.setText(dummyRequest);
+                    dummyRequest=helpers.addParameter(dummyRequest, helpers.buildParameter("bytestream", byteArrayToHex(body), IParameter.PARAM_BODY));
+                    // Show only the body (the editable params + bytestream=), not the
+                    // synthetic HTTP request line/headers buildHttpRequest produced:
+                    // those headers are never honoured (getMessage rebuilds with the
+                    // real message headers), so displaying them is just misleading.
+                    IRequestInfo dummyInfo=helpers.analyzeRequest(dummyRequest);
+                    byte[] paramsOnly=Arrays.copyOfRange(dummyRequest, dummyInfo.getBodyOffset(), dummyRequest.length);
+                    // One parameter per line for readability. Values are URL-encoded,
+                    // so '&' only separates params (never appears inside a value),
+                    // making this reversible in getMessage().
+                    String display=new String(paramsOnly, java.nio.charset.StandardCharsets.ISO_8859_1).replace("&", "\n");
+                    txtInput.setText(display.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
                     txtInput.setEditable(editable);
                 }catch(EOFException eofe){
                     debug("\nReached EOFin setMessage()");
@@ -1027,15 +1037,26 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             PrintWriter stdout = new PrintWriter(callbacks.getStdout(), true);
             debug("[*] Setting message from dummy POST");
 
-            IRequestInfo dummyRequest=helpers.analyzeRequest(txtInput.getText());
+            // The editor now shows only the parameter body (no request line or
+            // headers), so wrap it back into a minimal request before parsing the
+            // body params. The synthetic wrapper is thrown away; only the params
+            // are read.
+            // Editor shows one param per line; rejoin into an &-separated body (no
+            // literal '&'/newline exists inside URL-encoded values) before wrapping.
+            String shownText=new String(txtInput.getText(), java.nio.charset.StandardCharsets.ISO_8859_1);
+            byte[] shownBody=shownText.replace("\r","").replace("\n","&").getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+            byte[] wrapped=helpers.buildHttpMessage(
+                    java.util.Arrays.asList("POST / HTTP/1.1", "Content-Type: application/x-www-form-urlencoded"),
+                    shownBody);
+            IRequestInfo dummyRequest=helpers.analyzeRequest(wrapped);
             HashMap<String,String> paramStrings=new HashMap<String,String>(); // Not necessarily optimal, but code is nicer...
             HashMap<String,Integer> paramInts=new HashMap<String,Integer>();
             HashMap<String,Boolean> paramBools=new HashMap<String,Boolean>();
             ArrayList<String> invalidInts=new ArrayList<String>();
             ArrayList<String> invalidBools=new ArrayList<String>();
-            String overrideHex=null; // raw plain-byte body override (edited "original=" param)
+            String overrideHex=null; // raw plain-byte body override (edited "bytestream=" param)
             for (IParameter p: dummyRequest.getParameters()){
-                if (p.getName().equals("original")){
+                if (p.getName().equals("bytestream")){
                     overrideHex=p.getValue();
                 }else if (p.getName().startsWith("string_")){
                     debug("[+] Found string parameter: "+p.getName()+"="+p.getValue().toString());
@@ -1075,8 +1096,8 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             }
             byte[] body=Arrays.copyOfRange(currentMessage, bodyOffset, currentMessage.length);
 
-            // Experimental plain-byte override: if the user edited the
-            // "original=<hex>" parameter, use those bytes verbatim as the body
+            // Plain-byte override: if the user edited the
+            // "bytestream=<hex>" parameter, use those bytes verbatim as the body
             // (no serialisation, no patching, no field logic), for both requests
             // and responses. This wins over string_/int_/bool_ edits. Evaluated
             // before the invalid-field dialog so a pure byte override is not
@@ -1091,7 +1112,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                         return helpers.buildHttpMessage(httpHeaders, raw);
                     }
                     // Invalid hex: warn and fall through to normal field handling.
-                    String warn="The 'original=' override hex is invalid (needs an even count "
+                    String warn="The 'bytestream=' override hex is invalid (needs an even count "
                             +"of hex digits, 0-9/a-f only). Raw override skipped; field edits still apply.";
                     callbacks.issueAlert(warn);
                     javax.swing.JOptionPane.showMessageDialog(txtInput.getComponent(), warn,
