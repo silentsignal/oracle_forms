@@ -63,6 +63,17 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
     private static final String FRM_HIGHLIGHT_SETTING="oracle_forms_frm_highlight";
     private static final Pattern FRM_ERROR_PATTERN=Pattern.compile("(?:FRM|ORA)-\\d+");
 
+    // Scope for the modifying transforms (match/replace + boolean policy). The
+    // FRM/ORA highlight is read-only recon and is NOT gated by this.
+    private static final int SCOPE_ALL=0, SCOPE_SUITE=1, SCOPE_CUSTOM=2;
+    private static final String[] SCOPE_MODE_LABELS={
+        "All Forms traffic (ignore scope)", "Burp Target scope only", "Custom URL regex"};
+    private volatile int scopeMode=SCOPE_ALL;
+    private volatile String scopeCustomRegex="";
+    private volatile Pattern scopeCustomPattern=null; // compiled cache of scopeCustomRegex
+    private static final String SCOPE_MODE_SETTING="oracle_forms_scope_mode";
+    private static final String SCOPE_REGEX_SETTING="oracle_forms_scope_regex";
+
     // Verbose trace output; silenced unless the user enables debug in the tab.
     private void debug(String s){
         if (debugEnabled){
@@ -387,6 +398,77 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         return matchReplaceEnabled && boolRequestMode!=BOOL_NONE;
     }
 
+    // Recompile the custom-scope regex after it changes. Empty regex disables
+    // custom matching (pattern stays null -> matches nothing); an invalid regex
+    // is logged and also leaves the pattern null.
+    private void recompileScopePattern(){
+        String r=scopeCustomRegex;
+        if (r==null || r.isEmpty()){
+            scopeCustomPattern=null;
+            return;
+        }
+        try{
+            scopeCustomPattern=Pattern.compile(r);
+        }catch(PatternSyntaxException pse){
+            scopeCustomPattern=null;
+            stdout.println("[!] Invalid custom scope regex (\""+r+"\"), matching nothing: "+pse.getMessage());
+        }
+    }
+
+    // Whether this URL may be modified by the transforms. The FRM/ORA highlight
+    // does NOT call this (it stays global). Custom mode with an empty/invalid
+    // regex matches nothing until a valid regex is entered.
+    private boolean allowedByScope(java.net.URL url){
+        switch(scopeMode){
+            case SCOPE_SUITE:  return callbacks.isInScope(url);
+            case SCOPE_CUSTOM: return customScopeMatches(url);
+            default:           return true; // SCOPE_ALL
+        }
+    }
+
+    // Match the custom regex against the request URL. Burp's
+    // IRequestInfo.getUrl() includes an explicit port (e.g.
+    // https://host:443/...), which breaks intuitive patterns like
+    // "https://host/forms.*". So we test the raw URL and, when the port is the
+    // scheme default (80/443), also a form with that port stripped, matching if
+    // EITHER hits. Uses find() (substring match).
+    private boolean customScopeMatches(java.net.URL url){
+        Pattern p=scopeCustomPattern;
+        if (p==null){
+            return false;
+        }
+        String full=url.toString();
+        boolean hit=p.matcher(full).find();
+        if (!hit){
+            String stripped=stripDefaultPort(url);
+            if (stripped!=null && !stripped.equals(full)){
+                hit=p.matcher(stripped).find();
+            }
+        }
+        debug("[scope] custom regex vs \""+full+"\" -> "+hit);
+        return hit;
+    }
+
+    // "https://host:443/path" -> "https://host/path" (and :80 for http). Returns
+    // null when there is no explicit port or it is not the scheme default.
+    private static String stripDefaultPort(java.net.URL u){
+        int port=u.getPort();
+        if (port<0){
+            return null;
+        }
+        String proto=u.getProtocol();
+        boolean isDefault=("https".equalsIgnoreCase(proto) && port==443)
+                        || ("http".equalsIgnoreCase(proto) && port==80);
+        if (!isDefault){
+            return null;
+        }
+        try{
+            return new java.net.URL(proto, u.getHost(), -1, u.getFile()).toString();
+        }catch(java.net.MalformedURLException e){
+            return null;
+        }
+    }
+
     // Apply the global boolean policy (flip / force true / force false) to every
     // Boolean property in the tree, descending into nested Messages. Booleans are
     // detected by value type, so no property-type code is needed. Returns the
@@ -561,6 +643,16 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             }catch(NumberFormatException nfe){
                 boolRequestMode=BOOL_NONE;
             }
+            try{
+                String sm=callbacks.loadExtensionSetting(SCOPE_MODE_SETTING);
+                int parsed=(sm==null||sm.isEmpty())?SCOPE_ALL:Integer.parseInt(sm.trim());
+                scopeMode=(parsed>=SCOPE_ALL && parsed<=SCOPE_CUSTOM)?parsed:SCOPE_ALL;
+            }catch(NumberFormatException nfe){
+                scopeMode=SCOPE_ALL;
+            }
+            String sr=callbacks.loadExtensionSetting(SCOPE_REGEX_SETTING);
+            scopeCustomRegex=(sr==null)?"":sr;
+            recompileScopePattern();
             String data=callbacks.loadExtensionSetting(MR_RULES_SETTING);
             mrRules.clear();
             if (data!=null && !data.isEmpty()){
@@ -595,6 +687,8 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             callbacks.saveExtensionSetting(DEBUG_SETTING, debugEnabled?"true":"false");
             callbacks.saveExtensionSetting(FRM_HIGHLIGHT_SETTING, frmHighlightEnabled?"true":"false");
             callbacks.saveExtensionSetting(BOOL_MODE_SETTING, Integer.toString(boolRequestMode));
+            callbacks.saveExtensionSetting(SCOPE_MODE_SETTING, Integer.toString(scopeMode));
+            callbacks.saveExtensionSetting(SCOPE_REGEX_SETTING, scopeCustomRegex);
         }catch(Exception e){
             stdout.println("[!] Failed to save match/replace settings: "+e);
         }
@@ -662,8 +756,8 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         }
 
         // Automatic match/replace and/or global boolean policy on the
-        // (validated) request body.
-        if (hasApplicableRules(true) || boolPolicyActive()){
+        // (validated) request body, subject to the configured scope.
+        if ((hasApplicableRules(true) || boolPolicyActive()) && allowedByScope(rInfo.getUrl())){
             try{
                 byte[] newBody=transformRequestBody(body);
                 if (newBody!=null){
@@ -707,10 +801,10 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         }
 
         if (frmHighlightEnabled){
-            highlightFormsErrors(messageInfo, body);
+            highlightFormsErrors(messageInfo, body); // read-only recon, stays global (not scope-gated)
         }
 
-        if (mrActive){
+        if (mrActive && allowedByScope(reqInfo.getUrl())){
             try{
                 byte[] newBody=transformResponseBody(body);
                 if (newBody!=null){
@@ -1332,12 +1426,51 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             boolRow.add(new javax.swing.JLabel("Booleans in requests: "));
             boolRow.add(boolMode);
 
+            // Scope for the modifying transforms (match/replace + boolean policy):
+            // all traffic / Burp Target scope / a custom URL regex. The regex
+            // field is enabled only in Custom mode. FRM/ORA highlighting is not
+            // affected by this and always runs on all Forms responses.
+            final javax.swing.JTextField scopeRegexField=new javax.swing.JTextField(scopeCustomRegex, 24);
+            scopeRegexField.setEnabled(scopeMode==SCOPE_CUSTOM);
+            scopeRegexField.setToolTipText("Java regex matched (find) against the request URL. The scheme default port (:80/:443) is optional in your pattern; non-default ports appear in the URL. Enable debug output to log the exact URL tested.");
+            final javax.swing.JComboBox<String> scopeCombo=new javax.swing.JComboBox<String>(SCOPE_MODE_LABELS);
+            scopeCombo.setToolTipText("Which Forms traffic match/replace and the boolean policy apply to. FRM/ORA highlighting always runs on all Forms responses.");
+            scopeCombo.setSelectedIndex(scopeMode);
+            scopeCombo.setMaximumSize(scopeCombo.getPreferredSize());
+            scopeCombo.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){
+                    scopeMode=scopeCombo.getSelectedIndex();
+                    scopeRegexField.setEnabled(scopeMode==SCOPE_CUSTOM);
+                    saveMatchReplaceSettings();
+                }
+            });
+            scopeRegexField.getDocument().addDocumentListener(new javax.swing.event.DocumentListener(){
+                private void update(){
+                    scopeCustomRegex=scopeRegexField.getText();
+                    recompileScopePattern();
+                    saveMatchReplaceSettings();
+                }
+                public void insertUpdate(javax.swing.event.DocumentEvent e){ update(); }
+                public void removeUpdate(javax.swing.event.DocumentEvent e){ update(); }
+                public void changedUpdate(javax.swing.event.DocumentEvent e){ update(); }
+            });
+            javax.swing.JPanel scopeRow=new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 0, 0));
+            scopeRow.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+            scopeRow.add(new javax.swing.JLabel("Apply match/replace & boolean policy to: "));
+            scopeRow.add(scopeCombo);
+            javax.swing.JPanel scopeRegexRow=new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 0, 0));
+            scopeRegexRow.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+            scopeRegexRow.add(new javax.swing.JLabel("Custom URL regex: "));
+            scopeRegexRow.add(scopeRegexField);
+
             javax.swing.JPanel top=new javax.swing.JPanel();
             top.setLayout(new javax.swing.BoxLayout(top, javax.swing.BoxLayout.Y_AXIS));
             top.setBorder(javax.swing.BorderFactory.createTitledBorder("Options"));
             top.add(frmBox);
             top.add(debugBox);
             top.add(boolRow);
+            top.add(scopeRow);
+            top.add(scopeRegexRow);
 
             // Master banner on top, secondary options below it.
             javax.swing.JPanel north=new javax.swing.JPanel();
