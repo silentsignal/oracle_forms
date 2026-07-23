@@ -115,7 +115,18 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             sb.append(String.format("%02x", b & 0xff));
         return sb.toString();
     }
-    
+
+    // Decode a validated even-length hex string to bytes (inverse of
+    // byteArrayToHex). Callers must validate/strip the input first.
+    static byte[] hexToBytes(String hex){
+        int n=hex.length()/2;
+        byte[] out=new byte[n];
+        for (int i=0;i<n;i++){
+            out[i]=(byte)Integer.parseInt(hex.substring(2*i, 2*i+2), 16);
+        }
+        return out;
+    }
+
     private String messageToString(Message m){
         StringBuilder ret=new StringBuilder();
         /*if (m.isDeltaMessage()){
@@ -1022,8 +1033,11 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             HashMap<String,Boolean> paramBools=new HashMap<String,Boolean>();
             ArrayList<String> invalidInts=new ArrayList<String>();
             ArrayList<String> invalidBools=new ArrayList<String>();
+            String overrideHex=null; // raw plain-byte body override (edited "original=" param)
             for (IParameter p: dummyRequest.getParameters()){
-                if (p.getName().startsWith("string_")){
+                if (p.getName().equals("original")){
+                    overrideHex=p.getValue();
+                }else if (p.getName().startsWith("string_")){
                     debug("[+] Found string parameter: "+p.getName()+"="+p.getValue().toString());
                     paramStrings.put(p.getName(), helpers.urlDecode(p.getValue()));
                 }else if(p.getName().startsWith("int_")){
@@ -1048,11 +1062,46 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 }
             }
 
-            // Don't silently drop bad integer input: tell the user which fields
-            // could not be applied, both as a modal dialog (so it is impossible
-            // to miss when forwarding) and as a Burp alert (persistent record).
-            // The invalid fields keep their original value; any other edits in
-            // the message are still applied.
+            int bodyOffset;
+            List<String> httpHeaders;
+            if (currentIsRequest){
+                IRequestInfo rInfo=helpers.analyzeRequest(currentMessage);
+                bodyOffset=rInfo.getBodyOffset();
+                httpHeaders=rInfo.getHeaders();
+            }else{
+                IResponseInfo rInfo=helpers.analyzeResponse(currentMessage);
+                bodyOffset=rInfo.getBodyOffset();
+                httpHeaders=rInfo.getHeaders();
+            }
+            byte[] body=Arrays.copyOfRange(currentMessage, bodyOffset, currentMessage.length);
+
+            // Experimental plain-byte override: if the user edited the
+            // "original=<hex>" parameter, use those bytes verbatim as the body
+            // (no serialisation, no patching, no field logic), for both requests
+            // and responses. This wins over string_/int_/bool_ edits. Evaluated
+            // before the invalid-field dialog so a pure byte override is not
+            // interrupted by unrelated field warnings.
+            if (overrideHex!=null){
+                String edited=helpers.urlDecode(overrideHex).replaceAll("\\s","");
+                if (!edited.equalsIgnoreCase(byteArrayToHex(body))){ // user actually changed it
+                    if (edited.matches("[0-9A-Fa-f]*") && edited.length()%2==0){
+                        byte[] raw=hexToBytes(edited);
+                        stdout.println("[*] Plain byte override: body replaced with "+raw.length
+                                +" user-supplied bytes (field edits ignored)");
+                        return helpers.buildHttpMessage(httpHeaders, raw);
+                    }
+                    // Invalid hex: warn and fall through to normal field handling.
+                    String warn="The 'original=' override hex is invalid (needs an even count "
+                            +"of hex digits, 0-9/a-f only). Raw override skipped; field edits still apply.";
+                    callbacks.issueAlert(warn);
+                    javax.swing.JOptionPane.showMessageDialog(txtInput.getComponent(), warn,
+                            "Oracle Forms Serializer - invalid override hex", javax.swing.JOptionPane.ERROR_MESSAGE);
+                }
+            }
+
+            // Don't silently drop bad field input: tell the user which fields
+            // could not be applied (modal dialog + Burp alert). Invalid fields
+            // keep their original value; other edits still apply.
             if (!invalidInts.isEmpty() || !invalidBools.isEmpty()){
                 StringBuilder sb=new StringBuilder();
                 sb.append("These field(s) had invalid input and were NOT applied:\n\n");
@@ -1068,19 +1117,6 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 javax.swing.JOptionPane.showMessageDialog(txtInput.getComponent(), warning,
                         "Oracle Forms Serializer - invalid integer input", javax.swing.JOptionPane.ERROR_MESSAGE);
             }
-
-            int bodyOffset;
-            List<String> httpHeaders;
-            if (currentIsRequest){
-                IRequestInfo rInfo=helpers.analyzeRequest(currentMessage);
-                bodyOffset=rInfo.getBodyOffset();
-                httpHeaders=rInfo.getHeaders();
-            }else{
-                IResponseInfo rInfo=helpers.analyzeResponse(currentMessage);
-                bodyOffset=rInfo.getBodyOffset();
-                httpHeaders=rInfo.getHeaders();
-            }
-            byte[] body=Arrays.copyOfRange(currentMessage, bodyOffset, currentMessage.length);
 
             // Responses cannot be re-serialised: frmall.jar is the CLIENT
             // library, so Message.writeDetails() only knows how to emit
