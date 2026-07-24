@@ -26,11 +26,12 @@ import oracle.forms.engine.FormsDispatcher;
 import oracle.forms.engine.FormsMessage;
 import oracle.forms.engine.Message;
 
-public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IScannerInsertionPointProvider, IHttpListener
+public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IScannerInsertionPointProvider, IHttpListener, IContextMenuFactory
 {
     private PrintWriter stdout;
     private IBurpExtenderCallbacks callbacks;
     private IExtensionHelpers helpers;
+    private OracleFormsSearchTab searchTab; // Forms-aware history search (suite tab + context menu)
     private byte[] clientKey=null;
     private byte[] serverKey=null;
     private byte[] rc4Key=new byte[5];
@@ -103,6 +104,11 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         // Automatic match/replace: restore persisted rules and add the config tab.
         loadMatchReplaceSettings();
         callbacks.addSuiteTab(new OracleFormsMatchReplaceTab());
+
+        // Forms-aware search: suite tab + a right-click entry that pre-fills it.
+        searchTab=new OracleFormsSearchTab();
+        callbacks.addSuiteTab(searchTab);
+        callbacks.registerContextMenuFactory(this);
     }
     
     public boolean gotKey(){
@@ -204,6 +210,51 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             return i;
         }
         return -1;
+    }
+
+    // Case-insensitive (ASCII-folding) variant of indexOf: `needleLower` must
+    // already be lower-cased. Only A-Z/a-z are folded; other bytes compare
+    // exactly. Used by the Forms-search prefilter, where a miss must be
+    // reliable for ASCII input but false positives are harmless.
+    static int asciiFoldIndexOf(byte[] haystack, byte[] needleLower){
+        if (needleLower.length==0 || needleLower.length>haystack.length){
+            return -1;
+        }
+        outer:
+        for (int i=0; i<=haystack.length-needleLower.length; i++){
+            for (int j=0;j<needleLower.length;j++){
+                if (toLowerAscii(haystack[i+j])!=needleLower[j]){
+                    continue outer;
+                }
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    private static byte toLowerAscii(byte b){
+        return (b>='A' && b<='Z') ? (byte)(b+32) : b;
+    }
+
+    private static boolean isPureAscii(String s){
+        for (int i=0;i<s.length();i++){
+            if (s.charAt(i)>0x7f){
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isAllDigits(String s){
+        if (s.isEmpty()){
+            return false;
+        }
+        for (int i=0;i<s.length();i++){
+            if (!Character.isDigit(s.charAt(i))){
+                return false;
+            }
+        }
+        return true;
     }
 
     // Recursively collect every editable String (type 1) and Integer (type 3)
@@ -1978,6 +2029,567 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 }
             }
             return selfMatch || anyChildKept;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Forms-aware search. Oracle Forms bodies are serialized binary, so Burp's
+    // own history/site-map search can't see the plaintext values inside them.
+    // This deserializes the Forms bodies already captured in proxy history (and
+    // optionally the site map) and matches a literal/regex query against the
+    // string and integer leaf values, reporting where each hit occurred.
+    // ---------------------------------------------------------------------
+
+    // One search result row. Holds the source item so result actions
+    // (Repeater / view / highlight) can act on it; the body is re-derived on
+    // demand rather than retained.
+    static class SearchHit {
+        final IHttpRequestResponse item;
+        final int index;
+        final String url;
+        final boolean isRequest;
+        final String location; // path key, e.g. string_12_5 / int_3_0
+        final String value;
+        SearchHit(IHttpRequestResponse item, int index, String url, boolean isRequest, String location, String value){
+            this.item=item; this.index=index; this.url=url; this.isRequest=isRequest; this.location=location; this.value=value;
+        }
+    }
+
+    // Serialized Forms body of a request, or null if this isn't a Forms POST or
+    // is a handshake / NULLPOST / empty body (mirrors processHttpMessage()).
+    private byte[] formsRequestBody(byte[] request, IRequestInfo rInfo){
+        if (rInfo.getUrl()==null || rInfo.getUrl().toString().indexOf("/lservlet")==-1
+                || !"POST".equalsIgnoreCase(rInfo.getMethod())){
+            return null;
+        }
+        int off=rInfo.getBodyOffset();
+        if (off<0 || off>=request.length){
+            return null;
+        }
+        byte[] body=Arrays.copyOfRange(request, off, request.length);
+        if (body.length==0){
+            return null;
+        }
+        if (body.length>=4 && body[0]=='G' && body[1]=='D' && body[2]=='a' && body[3]=='y'){
+            return null; // GDay handshake
+        }
+        if (body.length>=8
+                && new String(body, 0, 8, java.nio.charset.StandardCharsets.ISO_8859_1).equals("NULLPOST")){
+            return null;
+        }
+        return body;
+    }
+
+    // Serialized Forms body of a response, or null if it isn't a Forms
+    // octet-stream body (mirrors processResponse()).
+    private byte[] formsResponseBody(byte[] response){
+        if (response==null){
+            return null;
+        }
+        IResponseInfo rInfo=helpers.analyzeResponse(response);
+        String ct=getHeaderValue(rInfo.getHeaders(), "content-type");
+        if (ct==null || ct.toLowerCase().indexOf("application/octet-stream")==-1){
+            return null;
+        }
+        int off=rInfo.getBodyOffset();
+        if (off<0 || off>=response.length){
+            return null;
+        }
+        byte[] body=Arrays.copyOfRange(response, off, response.length);
+        return body.length==0 ? null : body;
+    }
+
+    // Path-keyed string+integer leaves of a Forms body (integers rendered as
+    // decimal text so they're searchable too). Null on parse failure so the
+    // caller skips this item. Uses a local string table per stream.
+    private java.util.LinkedHashMap<String,String> collectBodyValues(byte[] body){
+        java.util.LinkedHashMap<String,String> strings=new java.util.LinkedHashMap<String,String>();
+        java.util.LinkedHashMap<String,Integer> ints=new java.util.LinkedHashMap<String,Integer>();
+        java.util.LinkedHashMap<String,Boolean> bools=new java.util.LinkedHashMap<String,Boolean>();
+        String[] localAs=new String[256];
+        try{
+            ByteArrayInputStream bis=new ByteArrayInputStream(body);
+            DataInputStream dis=new DataInputStream(bis);
+            Message m;
+            int m_id=0;
+            while((m=Message.readDetails(dis,localAs))!=null){
+                collectStrings(m, "_"+m_id, strings, ints, bools);
+                m_id++;
+            }
+        }catch(EOFException eofe){
+            // normal end of stream
+        }catch(Exception e){
+            return null; // unparseable — skip
+        }
+        java.util.LinkedHashMap<String,String> out=new java.util.LinkedHashMap<String,String>(strings);
+        for (java.util.Map.Entry<String,Integer> e: ints.entrySet()){
+            out.put(e.getKey(), e.getValue().toString());
+        }
+        return out;
+    }
+
+    // Run the search over the given items. Throws PatternSyntaxException for an
+    // invalid regex (the UI validates first, so this is a safety net).
+    private static final byte[] LSERVLET_BYTES="/lservlet".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+    private static final byte[] EMPTY_BYTES=new byte[0]; // Burp message editors reject null; pass this to clear.
+
+    // Run the search over the given items. `progress` (nullable) is called with
+    // the number of items scanned so far; `cancelled` (nullable) is polled so a
+    // long scan can be interrupted, returning the hits found up to that point.
+    List<SearchHit> searchForms(IHttpRequestResponse[] items, String query,
+            boolean regex, boolean ignoreCase, boolean searchReq, boolean searchResp,
+            java.util.function.IntConsumer progress, java.util.concurrent.atomic.AtomicBoolean cancelled){
+        List<SearchHit> hits=new ArrayList<SearchHit>();
+        if (items==null || query==null || query.isEmpty()){
+            return hits;
+        }
+        Pattern pat=regex ? Pattern.compile(query, ignoreCase?Pattern.CASE_INSENSITIVE:0) : null;
+        String literal=regex ? null : (ignoreCase?query.toLowerCase():query);
+
+        // Cheap raw-byte prefilter: for a literal, ASCII, non-all-digit query the
+        // query bytes must appear verbatim (modified-UTF-8) in any body that
+        // contains a matching string, so a raw-byte miss lets us skip the
+        // expensive deserialization. Disabled for regex / non-ASCII / all-digit
+        // queries (the latter can match a binary integer leaf).
+        byte[] preNeedle=null;
+        if (pat==null && isPureAscii(query) && !isAllDigits(query)){
+            try{
+                byte[] utf=utfBytes(query); // 2-byte length prefix + mUTF-8 value bytes
+                preNeedle=Arrays.copyOfRange(utf, 2, utf.length);
+                if (ignoreCase){
+                    for (int k=0;k<preNeedle.length;k++){
+                        preNeedle[k]=toLowerAscii(preNeedle[k]);
+                    }
+                }
+            }catch(IOException ioe){
+                preNeedle=null; // fall back to always parsing
+            }
+        }
+
+        for (int i=0;i<items.length;i++){
+            if (cancelled!=null && cancelled.get()){
+                break;
+            }
+            if (progress!=null){
+                progress.accept(i);
+            }
+            IHttpRequestResponse item=items[i];
+            if (item==null){
+                continue;
+            }
+            byte[] request=item.getRequest();
+            if (request==null){
+                continue;
+            }
+            // Cheap check before the URL parse: a Forms POST always contains
+            // "/lservlet" in its request line, so skip analyzeRequest entirely
+            // for the (usually many) non-Forms items.
+            if (indexOf(request, LSERVLET_BYTES, 0)<0){
+                continue;
+            }
+            IRequestInfo rInfo;
+            try{
+                rInfo=helpers.analyzeRequest(item);
+            }catch(RuntimeException e){
+                continue;
+            }
+            String url=(rInfo.getUrl()==null)?"":rInfo.getUrl().toString();
+            if (searchReq){
+                byte[] body=formsRequestBody(request, rInfo);
+                if (body!=null){
+                    collectHits(hits, item, i, url, true, body, pat, literal, ignoreCase, preNeedle);
+                }
+            }
+            if (searchResp && url.indexOf("/lservlet")!=-1){
+                byte[] body=formsResponseBody(item.getResponse());
+                if (body!=null){
+                    collectHits(hits, item, i, url, false, body, pat, literal, ignoreCase, preNeedle);
+                }
+            }
+        }
+        if (progress!=null){
+            progress.accept(items.length);
+        }
+        return hits;
+    }
+
+    private void collectHits(List<SearchHit> hits, IHttpRequestResponse item, int index,
+            String url, boolean isRequest, byte[] body, Pattern pat, String literal,
+            boolean ignoreCase, byte[] preNeedle){
+        // Skip the expensive deserialization when the raw body can't contain the
+        // literal (see the prefilter note in searchForms).
+        if (preNeedle!=null){
+            int at=ignoreCase ? asciiFoldIndexOf(body, preNeedle) : indexOf(body, preNeedle, 0);
+            if (at<0){
+                return;
+            }
+        }
+        java.util.LinkedHashMap<String,String> values=collectBodyValues(body);
+        if (values==null){
+            return;
+        }
+        for (java.util.Map.Entry<String,String> e: values.entrySet()){
+            String v=e.getValue();
+            if (v==null){
+                continue;
+            }
+            boolean match=(pat!=null)
+                ? pat.matcher(v).find()
+                : (ignoreCase?v.toLowerCase():v).contains(literal);
+            if (match){
+                hits.add(new SearchHit(item, index, url, isRequest, e.getKey(), v));
+            }
+        }
+    }
+
+    // Right-click entry that pre-fills and runs the search tab from selected text.
+    @Override
+    public java.util.List<javax.swing.JMenuItem> createMenuItems(IContextMenuInvocation invocation){
+        final String seed=selectedTextFrom(invocation);
+        java.util.List<javax.swing.JMenuItem> items=new ArrayList<javax.swing.JMenuItem>();
+        javax.swing.JMenuItem mi=new javax.swing.JMenuItem(
+                (seed!=null && !seed.isEmpty()) ? "Search Forms history for selection…" : "Search Forms history…");
+        mi.addActionListener(new java.awt.event.ActionListener(){
+            public void actionPerformed(java.awt.event.ActionEvent e){
+                if (searchTab!=null){
+                    searchTab.searchFor(seed);
+                }
+            }
+        });
+        items.add(mi);
+        return items;
+    }
+
+    // Best-effort selected text from the invocation: apply the selection bounds
+    // to the request or response bytes depending on the context. Null if there
+    // is no usable selection.
+    private String selectedTextFrom(IContextMenuInvocation invocation){
+        try{
+            int[] bounds=invocation.getSelectionBounds();
+            IHttpRequestResponse[] msgs=invocation.getSelectedMessages();
+            if (bounds==null || bounds.length<2 || bounds[0]==bounds[1] || msgs==null || msgs.length==0){
+                return null;
+            }
+            byte ctx=invocation.getInvocationContext();
+            boolean resp=(ctx==IContextMenuInvocation.CONTEXT_MESSAGE_EDITOR_RESPONSE
+                       || ctx==IContextMenuInvocation.CONTEXT_MESSAGE_VIEWER_RESPONSE);
+            byte[] data=resp ? msgs[0].getResponse() : msgs[0].getRequest();
+            if (data==null){
+                return null;
+            }
+            int start=Math.max(0, Math.min(bounds[0], bounds[1]));
+            int end=Math.min(data.length, Math.max(bounds[0], bounds[1]));
+            if (end<=start){
+                return null;
+            }
+            return new String(Arrays.copyOfRange(data, start, end), java.nio.charset.StandardCharsets.ISO_8859_1);
+        }catch(RuntimeException e){
+            return null;
+        }
+    }
+
+    // Suite tab: query field + options, a results table, and per-row actions.
+    class OracleFormsSearchTab implements ITab {
+        private final javax.swing.JPanel panel;
+        private final javax.swing.JTextField queryField=new javax.swing.JTextField(28);
+        private final javax.swing.JCheckBox regexBox=new javax.swing.JCheckBox("regex");
+        private final javax.swing.JCheckBox caseBox=new javax.swing.JCheckBox("ignore case", true);
+        private final javax.swing.JCheckBox reqBox=new javax.swing.JCheckBox("requests", true);
+        private final javax.swing.JCheckBox respBox=new javax.swing.JCheckBox("responses", true);
+        private final javax.swing.JCheckBox historyBox=new javax.swing.JCheckBox("proxy history", true);
+        private final javax.swing.JCheckBox sitemapBox=new javax.swing.JCheckBox("site map", false);
+        private final javax.swing.JButton searchBtn=new javax.swing.JButton("Search");
+        private final javax.swing.JButton cancelBtn=new javax.swing.JButton("Cancel");
+        private final javax.swing.JProgressBar progress=new javax.swing.JProgressBar();
+        private final javax.swing.JLabel status=new javax.swing.JLabel(" ");
+        private final java.util.List<SearchHit> results=new ArrayList<SearchHit>();
+        private final SearchTableModel model=new SearchTableModel();
+        private final javax.swing.JTable table=new javax.swing.JTable(model);
+        // Cancellation flag for the in-flight search (polled by searchForms).
+        private java.util.concurrent.atomic.AtomicBoolean cancelFlag=new java.util.concurrent.atomic.AtomicBoolean(false);
+        // Inline viewers for the selected result. Burp populates them with the
+        // raw tabs and this extension's own decrypted Forms tabs automatically.
+        private volatile IHttpRequestResponse currentItem;
+        private final IMessageEditor requestViewer;
+        private final IMessageEditor responseViewer;
+
+        OracleFormsSearchTab(){
+            panel=new javax.swing.JPanel(new java.awt.BorderLayout());
+
+            // Controller backs the viewers with the currently selected result so
+            // their built-in actions (e.g. send-to) target the right message.
+            IMessageEditorController controller=new IMessageEditorController(){
+                @Override public IHttpService getHttpService(){ return currentItem==null?null:currentItem.getHttpService(); }
+                @Override public byte[] getRequest(){ return currentItem==null?null:currentItem.getRequest(); }
+                @Override public byte[] getResponse(){ return currentItem==null?null:currentItem.getResponse(); }
+            };
+            requestViewer=callbacks.createMessageEditor(controller, false);
+            responseViewer=callbacks.createMessageEditor(controller, false);
+
+            javax.swing.JPanel row1=new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 4));
+            row1.add(new javax.swing.JLabel("Query:"));
+            row1.add(queryField);
+            row1.add(regexBox);
+            row1.add(caseBox);
+            row1.add(searchBtn);
+            row1.add(cancelBtn);
+            cancelBtn.setEnabled(false);
+            progress.setStringPainted(false);
+            progress.setPreferredSize(new java.awt.Dimension(160, 16));
+            progress.setVisible(false);
+            row1.add(progress);
+            javax.swing.JPanel row2=new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 0));
+            row2.add(new javax.swing.JLabel("Search:"));
+            row2.add(reqBox);
+            row2.add(respBox);
+            row2.add(new javax.swing.JLabel("    Source:"));
+            row2.add(historyBox);
+            row2.add(sitemapBox);
+            javax.swing.JPanel row3=new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 0));
+            row3.add(status);
+
+            javax.swing.JPanel north=new javax.swing.JPanel();
+            north.setLayout(new javax.swing.BoxLayout(north, javax.swing.BoxLayout.Y_AXIS));
+            row1.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+            row2.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+            row3.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+            north.add(row1);
+            north.add(row2);
+            north.add(row3);
+            north.setBorder(javax.swing.BorderFactory.createTitledBorder(
+                    "Oracle Forms search (deserializes Forms bodies Burp's own search can't see)"));
+            panel.add(north, java.awt.BorderLayout.NORTH);
+
+            table.setFillsViewportHeight(true);
+            table.setAutoResizeMode(javax.swing.JTable.AUTO_RESIZE_LAST_COLUMN);
+
+            // Results table on top; the selected result's request | response below.
+            javax.swing.JSplitPane reqResp=new javax.swing.JSplitPane(
+                    javax.swing.JSplitPane.HORIZONTAL_SPLIT,
+                    requestViewer.getComponent(), responseViewer.getComponent());
+            reqResp.setResizeWeight(0.5);
+            javax.swing.JSplitPane vertical=new javax.swing.JSplitPane(
+                    javax.swing.JSplitPane.VERTICAL_SPLIT,
+                    new javax.swing.JScrollPane(table), reqResp);
+            vertical.setResizeWeight(0.5);
+            panel.add(vertical, java.awt.BorderLayout.CENTER);
+
+            // Show the full request/response of whichever result is selected.
+            table.getSelectionModel().addListSelectionListener(new javax.swing.event.ListSelectionListener(){
+                public void valueChanged(javax.swing.event.ListSelectionEvent e){
+                    if (e.getValueIsAdjusting()){
+                        return;
+                    }
+                    SearchHit h=selectedHit();
+                    currentItem=(h==null)?null:h.item;
+                    byte[] req=(currentItem==null)?null:currentItem.getRequest();
+                    byte[] resp=(currentItem==null)?null:currentItem.getResponse();
+                    // Burp's message editor rejects null; use an empty array to clear.
+                    requestViewer.setMessage(req==null?EMPTY_BYTES:req, true);
+                    responseViewer.setMessage(resp==null?EMPTY_BYTES:resp, false);
+                }
+            });
+
+            searchBtn.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){ runSearch(); }
+            });
+            queryField.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){ runSearch(); }
+            });
+            cancelBtn.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){
+                    cancelFlag.set(true);
+                    cancelBtn.setEnabled(false);
+                    status.setText("Cancelling…");
+                }
+            });
+
+            final javax.swing.JPopupMenu menu=new javax.swing.JPopupMenu();
+            javax.swing.JMenuItem repeater=new javax.swing.JMenuItem("Send request to Repeater");
+            javax.swing.JMenuItem hilite=new javax.swing.JMenuItem("Highlight in history");
+            menu.add(repeater);
+            menu.add(hilite);
+            table.setComponentPopupMenu(menu);
+            repeater.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){ sendSelectedToRepeater(); }
+            });
+            hilite.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){ highlightSelected(); }
+            });
+
+            callbacks.customizeUiComponent(panel);
+        }
+
+        @Override public String getTabCaption(){ return "Oracle Forms Search"; }
+        @Override public Component getUiComponent(){ return panel; }
+
+        // Called from the context menu: fill the query and search immediately.
+        void searchFor(final String seed){
+            javax.swing.SwingUtilities.invokeLater(new Runnable(){
+                public void run(){
+                    if (seed!=null){
+                        queryField.setText(seed);
+                    }
+                    regexBox.setSelected(false); // selection text is a literal
+                    runSearch();
+                }
+            });
+        }
+
+        private SearchHit selectedHit(){
+            int row=table.getSelectedRow();
+            if (row<0){
+                return null;
+            }
+            int mrow=table.convertRowIndexToModel(row);
+            if (mrow<0 || mrow>=results.size()){
+                return null;
+            }
+            return results.get(mrow);
+        }
+
+        private void sendSelectedToRepeater(){
+            SearchHit h=selectedHit();
+            if (h==null){
+                return;
+            }
+            IHttpService svc=h.item.getHttpService();
+            byte[] req=h.item.getRequest();
+            if (svc==null || req==null){
+                return;
+            }
+            callbacks.sendToRepeater(svc.getHost(), svc.getPort(),
+                    "https".equalsIgnoreCase(svc.getProtocol()), req, "Forms search");
+        }
+
+        private void highlightSelected(){
+            SearchHit h=selectedHit();
+            if (h==null){
+                return;
+            }
+            h.item.setHighlight("cyan");
+            String note="Forms search: "+queryField.getText();
+            String existing=h.item.getComment();
+            if (existing==null || existing.isEmpty()){
+                h.item.setComment(note);
+            }else if (existing.indexOf(note)==-1){
+                h.item.setComment(existing+" | "+note);
+            }
+        }
+
+        private void runSearch(){
+            final String query=queryField.getText();
+            if (query==null || query.isEmpty()){
+                status.setText("Enter a query.");
+                return;
+            }
+            final boolean regex=regexBox.isSelected();
+            final boolean ignoreCase=caseBox.isSelected();
+            final boolean searchReq=reqBox.isSelected();
+            final boolean searchResp=respBox.isSelected();
+            final boolean useHistory=historyBox.isSelected();
+            final boolean useSitemap=sitemapBox.isSelected();
+            if (!searchReq && !searchResp){
+                status.setText("Tick requests and/or responses.");
+                return;
+            }
+            if (!useHistory && !useSitemap){
+                status.setText("Pick a source (proxy history and/or site map).");
+                return;
+            }
+            if (regex){
+                try{
+                    Pattern.compile(query);
+                }catch(PatternSyntaxException pse){
+                    status.setText("Invalid regex: "+pse.getDescription());
+                    return;
+                }
+            }
+            cancelFlag=new java.util.concurrent.atomic.AtomicBoolean(false);
+            final java.util.concurrent.atomic.AtomicBoolean cancel=cancelFlag;
+            searchBtn.setEnabled(false);
+            cancelBtn.setEnabled(true);
+            progress.setVisible(true);
+            progress.setIndeterminate(true);
+            status.setText("Searching…");
+            new javax.swing.SwingWorker<List<SearchHit>,Integer>(){
+                private int total=0;
+                @Override protected List<SearchHit> doInBackground(){
+                    java.util.LinkedHashSet<IHttpRequestResponse> items=new java.util.LinkedHashSet<IHttpRequestResponse>();
+                    if (useHistory){
+                        IHttpRequestResponse[] h=callbacks.getProxyHistory();
+                        if (h!=null){
+                            for (IHttpRequestResponse it: h){ items.add(it); }
+                        }
+                    }
+                    if (useSitemap){
+                        IHttpRequestResponse[] s=callbacks.getSiteMap(null);
+                        if (s!=null){
+                            for (IHttpRequestResponse it: s){ items.add(it); }
+                        }
+                    }
+                    total=items.size();
+                    // Throttle progress updates so a large history doesn't flood the EDT.
+                    java.util.function.IntConsumer prog=new java.util.function.IntConsumer(){
+                        public void accept(int c){
+                            if (c==total || (c & 63)==0){
+                                publish(c);
+                            }
+                        }
+                    };
+                    return searchForms(items.toArray(new IHttpRequestResponse[0]),
+                            query, regex, ignoreCase, searchReq, searchResp, prog, cancel);
+                }
+                @Override protected void process(java.util.List<Integer> chunks){
+                    int scanned=chunks.get(chunks.size()-1);
+                    if (total>0){
+                        progress.setIndeterminate(false);
+                        progress.setMaximum(total);
+                        progress.setValue(Math.min(scanned, total));
+                    }
+                    status.setText("scanned "+scanned+" / "+total+"…");
+                }
+                @Override protected void done(){
+                    try{
+                        List<SearchHit> hits=get();
+                        results.clear();
+                        results.addAll(hits);
+                        model.fireTableDataChanged();
+                        String prefix=cancel.get()?"Cancelled — ":"";
+                        status.setText(prefix+total+" item(s) scanned, "+hits.size()+" match(es).");
+                    }catch(Exception ex){
+                        status.setText("Search failed: "+ex);
+                    }finally{
+                        searchBtn.setEnabled(true);
+                        cancelBtn.setEnabled(false);
+                        progress.setIndeterminate(false);
+                        progress.setVisible(false);
+                    }
+                }
+            }.execute();
+        }
+
+        class SearchTableModel extends javax.swing.table.AbstractTableModel {
+            private final String[] cols={"#","URL","Dir","Location","Matched value"};
+            @Override public int getRowCount(){ return results.size(); }
+            @Override public int getColumnCount(){ return cols.length; }
+            @Override public String getColumnName(int c){ return cols[c]; }
+            @Override public boolean isCellEditable(int r, int c){ return false; }
+            @Override public Class<?> getColumnClass(int c){ return c==0 ? Integer.class : String.class; }
+            @Override public Object getValueAt(int r, int c){
+                if (r<0 || r>=results.size()){
+                    return null;
+                }
+                SearchHit h=results.get(r);
+                switch(c){
+                    case 0: return Integer.valueOf(h.index);
+                    case 1: return h.url;
+                    case 2: return h.isRequest?"Req":"Resp";
+                    case 3: return h.location;
+                    case 4: return h.value.length()>200 ? h.value.substring(0,200)+"…" : h.value;
+                }
+                return null;
+            }
         }
     }
 }

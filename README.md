@@ -39,6 +39,12 @@ Configure Burp to use the upstream proxy 127.0.0.1:8081 and load the OracleForms
 
 Now you can start your Oracle Forms application, configured to use Burp as its proxy. The mitmproxy script will corrupt the handshake, so the client won't encrypt its messages. The OracleFormSerializer extension will then do message serialization for you. Messages will be translated to standard HTTP GET requests in the OracleForms request editor tab with String parameters provided in a query string in the Message body. If you edit these parameters the extension will automatically update the original binary Forms message appropriately (e.g. in Repeater). The extension will also register new insertion points for the Scanner so you can use that too (keep in mind that insertion points provided by Burp will probably break stuff though!).
 
+### Forms-aware search
+
+Forms message bodies are serialized binary, so Burp's own search can't see the plaintext values inside them. The **Oracle Forms Search** suite tab deserializes the Forms messages already captured in your proxy history (and, optionally, the site map) and matches a literal or regex query against their String and Integer values. Results list where each hit occurred (message/property path) and let you send the request to Repeater, view the decrypted message, or highlight it in history. You can also right-click selected text anywhere in Burp and choose *Search Forms history for selection* to run the same search.
+
+Searching is fast even on large histories: for a plain-text query a cheap raw-byte prefilter skips the expensive deserialization of any message that can't contain it, and the scan runs in the background with a progress bar and a Cancel button. (The prefilter is bypassed for regex, non-ASCII, and all-digit queries, so results are always complete.)
+
 ### Building the Extension
 
 Download the `frmall.jar` archive from your target and copy it under `OracleFormsSerializer/lib`. Inside `OracleFormsSerializer/` start an Gradle build:
