@@ -39,9 +39,35 @@ Configure Burp to use the upstream proxy 127.0.0.1:8081 and load the OracleForms
 
 Now you can start your Oracle Forms application, configured to use Burp as its proxy. The mitmproxy script will corrupt the handshake, so the client won't encrypt its messages. The OracleFormSerializer extension will then do message serialization for you. Messages will be translated to standard HTTP GET requests in the OracleForms request editor tab with String parameters provided in a query string in the Message body. If you edit these parameters the extension will automatically update the original binary Forms message appropriately (e.g. in Repeater). The extension will also register new insertion points for the Scanner so you can use that too (keep in mind that insertion points provided by Burp will probably break stuff though!).
 
+### Editing Forms messages
+
+Every Forms request and response can be edited, not just viewed:
+
+* **Requests** — the **Oracle Forms** editor tab shows the message as editable `string_…`, `int_…` and `bool_…` parameters (one per line), including values nested inside other messages (e.g. `string_49_3_2`). Edit a value and the extension re-serializes the binary message for you (e.g. in Repeater or on Proxy intercept).
+* **Responses** — responses are editable too. Because `frmall.jar` is the *client* library and can't re-emit server-only constructs, response edits are applied by patching the changed string literal directly into the original bytes, so only String values can be edited on responses.
+* **Raw byte override** — the tab also shows the whole body as a `bytestream=<hex>` field; edit that to replace the message body verbatim (no serialization, no field logic) for arbitrary byte manipulation.
+* **Tree view** — the **Oracle Forms Tree** tab renders the message as a filterable tree (messages → properties → nested messages) with a right-click "show raw hex". On editable surfaces you can edit String/Integer/Boolean leaves in place (double-click or *Edit value…*).
+
+Response editing is only available where Burp gives you an editable editor (e.g. Proxy intercept).
+
+### Automatic match/replace and policies
+
+The **Oracle Forms M/R** suite tab applies transforms to live Forms traffic automatically:
+
+* **Match/replace rules** — a persisted table of String (regex) and Integer (exact) rules, each scoped to requests, responses, or both. Requests are re-serialized with the rules applied; responses are byte-patched (string rules only).
+* **Boolean policy** — a single *Booleans in requests* dropdown to flip all, set all true, or set all false for every boolean in a request.
+* **Scope** — limit the above to all Forms traffic (default), Burp Target scope only, or a custom URL regex, so rules don't fire on unrelated hosts.
+
+A single master switch enables or disables the whole engine (rules **and** the boolean policy), and everything persists across restarts.
+
+### Recon aids
+
+* **FRM/ORA error highlighting** — responses carrying `FRM-####`/`ORA-####` codes (e.g. authorization errors like `FRM-41084`, or `ORA-` SQL errors) are flagged with a red Proxy-history highlight, a comment listing the codes, and an alert. This stays on for all Forms responses regardless of the scope setting.
+* **Debug output toggle** — verbose logging is off by default; enable it from the M/R tab when you need to trace what the extension is doing.
+
 ### Forms-aware search
 
-Forms message bodies are serialized binary, so Burp's own search can't see the plaintext values inside them. The **Oracle Forms Search** suite tab deserializes the Forms messages already captured in your proxy history (and, optionally, the site map) and matches a literal or regex query against their String and Integer values. Results list where each hit occurred (message/property path) and let you send the request to Repeater, view the decrypted message, or highlight it in history. You can also right-click selected text anywhere in Burp and choose *Search Forms history for selection* to run the same search.
+Forms message bodies are serialized binary, so Burp's own search can't see the plaintext values inside them. The **Oracle Forms Search** suite tab deserializes the Forms messages already captured in your proxy history (and, optionally, the site map) and matches a literal or regex query against their String and Integer values. Results list where each hit occurred (message/property path), and selecting one shows the full HTTP request and response inline — including the extension's own decrypted Forms tabs — so you can inspect the match without leaving the tab. Right-click a result to send the request to Repeater or highlight it in history, or right-click selected text anywhere in Burp and choose *Search Forms history for selection* to run the same search.
 
 Searching is fast even on large histories: for a plain-text query a cheap raw-byte prefilter skips the expensive deserialization of any message that can't contain it, and the scan runs in the background with a progress bar and a Cancel button. (The prefilter is bypassed for regex, non-ASCII, and all-digit queries, so results are always complete.)
 
