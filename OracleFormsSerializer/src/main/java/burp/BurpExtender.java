@@ -96,7 +96,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         
         //callbacks.registerProxyListener(this);
         callbacks.registerMessageEditorTabFactory(this);
-        callbacks.registerMessageEditorTabFactory(new OracleFormsTreeTabFactory()); // read-only structured tree view
+        callbacks.registerMessageEditorTabFactory(new OracleFormsTreeTabFactory()); // structured tree view (editable on editable surfaces)
         callbacks.registerScannerInsertionPointProvider(this);
         callbacks.registerHttpListener(this);
 
@@ -567,7 +567,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         return baos.toByteArray();
     }
 
-    // Responses cannot be re-serialised (see patchResponse()). Apply string
+    // Responses cannot be re-serialised (see patchResponseBody()). Apply string
     // rules by byte-patching each changed literal in place. Returns the new
     // body, or null if nothing changed.
     private byte[] transformResponseBody(byte[] body){
@@ -861,6 +861,139 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         callbacks.issueAlert("Oracle Forms error in response: "+joined);
     }
 
+    // Re-serialise a request body with the given edits applied. Shared by the
+    // param tab and the tree tab. Returns originalMessage unchanged if
+    // re-serialisation fails (so Burp never gets a corrupt/truncated body).
+    byte[] reserializeRequestBody(byte[] body, List<String> httpHeaders,
+            java.util.Map<String,String> paramStrings, java.util.Map<String,Integer> paramInts,
+            java.util.Map<String,Boolean> paramBools, byte[] originalMessage){
+        String[] as=new String[256];
+        ByteArrayInputStream bis=new ByteArrayInputStream(body);
+        DataInputStream dis=new DataInputStream(bis);
+        int m_id=0;
+        ByteArrayOutputStream baos=new ByteArrayOutputStream();
+        DataOutputStream dos=new DataOutputStream(baos);
+        Message m;
+        // One dispatcher for the whole stream so the write-side string-reference
+        // table stays in sync (see the long note previously in getMessage()).
+        FormsDispatcher dispatcher=new FormsDispatcher();
+        boolean serialisationFailed=false;
+        try{
+            debug("[*] Enter stream parser");
+            while((m=Message.readDetails(dis,as))!=null){
+                debug("[*] Message start, ID: "+m_id+ " size: "+m.size());
+                applyEdits(m, "_"+m_id, paramStrings, paramInts, paramBools, stdout);
+                int resolved=resolveIndexTags(m);
+                if (resolved>0){
+                    debug("[*] Resolved "+resolved+" IndexTag reference(s) before writing message "+m_id);
+                }
+                m.writeDetails(dispatcher, dos);
+                m_id++;
+            }
+        }catch(EOFException eofe){
+            debug("\nReached EOF in reserializeRequestBody()");
+        }catch(IOException e){
+            stdout.println("Message IOException");
+            e.printStackTrace(stdout);
+        }catch(RuntimeException re){
+            // e.g. an IndexTag that could not be resolved. Forward the original
+            // message untouched rather than a corrupt body.
+            stdout.println("[!] Re-serialisation failed at message "+m_id+", forwarding original message unchanged:");
+            re.printStackTrace(stdout);
+            serialisationFailed=true;
+        }
+        if (serialisationFailed){
+            return originalMessage;
+        }
+        try{
+            dos.writeByte(-16);
+            dos.writeByte(0x01);
+            return helpers.buildHttpMessage(httpHeaders, baos.toByteArray());
+        }catch(IOException e){
+            stdout.println("Message IOException - last bytes");
+            e.printStackTrace(stdout);
+            return null;
+        }
+    }
+
+    // Apply string edits to a response by patching the raw body in place instead
+    // of re-serialising it (frmall.jar is the CLIENT library, so writeDetails()
+    // cannot re-emit server-only constructs). Shared by both editor tabs. Returns
+    // originalMessage on parse failure. Integer/boolean edits are not applied to
+    // responses (ambiguous to locate by value); changed ints are logged.
+    byte[] patchResponseBody(byte[] body, List<String> httpHeaders,
+            java.util.Map<String,String> paramStrings, java.util.Map<String,Integer> paramInts,
+            byte[] originalMessage){
+        HashMap<String,String> origStrings=new HashMap<String,String>();
+        HashMap<String,Integer> origInts=new HashMap<String,Integer>();
+        String[] as=new String[256];
+        try{
+            ByteArrayInputStream bis=new ByteArrayInputStream(body);
+            DataInputStream dis=new DataInputStream(bis);
+            Message m;
+            int m_id=0;
+            while((m=Message.readDetails(dis,as))!=null){
+                collectStrings(m, "_"+m_id, origStrings, origInts, new HashMap<String,Boolean>()); // same recursive keys as the editable surface
+                m_id++;
+            }
+        }catch(EOFException eofe){
+            // normal end of stream
+        }catch(Exception e){
+            stdout.println("[!] Failed to parse original response body for patching; forwarding unchanged:");
+            e.printStackTrace(stdout);
+            return originalMessage;
+        }
+
+        byte[] patched=body;
+        int changes=0;
+        for (String key: paramStrings.keySet()){
+            String newV=paramStrings.get(key);
+            String oldV=origStrings.get(key);
+            if (oldV==null || oldV.equals(newV)){
+                continue; // unknown key or value untouched by the user
+            }
+            try{
+                byte[] oldPat=utfBytes(oldV);
+                byte[] newPat=utfBytes(newV);
+                int idx=indexOf(patched, oldPat, 0);
+                if (idx<0){
+                    stdout.println("[!] Could not locate literal bytes for "+key+" (\""+oldV+"\") in the response body; this edit was skipped.");
+                    stdout.println("[!] The value is probably stored with an encoding this patcher does not recognise. Body hex follows so the format can be analysed:");
+                    stdout.println(byteArrayToHex(patched));
+                    continue;
+                }
+                if (indexOf(patched, oldPat, idx+oldPat.length)>=0){
+                    stdout.println("[!] Literal for "+key+" (\""+oldV+"\") occurs more than once; patching first occurrence at offset "+idx+" only.");
+                }
+                byte[] nb=new byte[patched.length-oldPat.length+newPat.length];
+                System.arraycopy(patched,0,nb,0,idx);
+                System.arraycopy(newPat,0,nb,idx,newPat.length);
+                System.arraycopy(patched,idx+oldPat.length,nb,idx+newPat.length,patched.length-(idx+oldPat.length));
+                patched=nb;
+                changes++;
+                stdout.println("[+] Patched "+key+": \""+oldV+"\" -> \""+newV+"\" at body offset "+idx);
+            }catch(IOException ioe){
+                stdout.println("[!] Failed to encode replacement for "+key+"; edit skipped.");
+                ioe.printStackTrace(stdout);
+            }
+        }
+
+        int intEdits=0;
+        for (String key: paramInts.keySet()){
+            Integer newV=paramInts.get(key);
+            Integer oldV=origInts.get(key);
+            if (oldV!=null && !oldV.equals(newV)){
+                intEdits++;
+            }
+        }
+        if (intEdits>0){
+            stdout.println("[*] Note: integer edits are not supported for responses (ambiguous to locate by value); "+intEdits+" changed int field(s) ignored.");
+        }
+
+        stdout.println("[*] Response patch complete: "+changes+" string(s) changed, new body length "+patched.length);
+        return helpers.buildHttpMessage(httpHeaders, patched);
+    }
+
     @Override
     public IMessageEditorTab createNewInstance(IMessageEditorController controller, boolean editable)
     {
@@ -1147,151 +1280,9 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             // patch the edited string(s) directly into the original response
             // bytes and leave everything else untouched.
             if (!currentIsRequest){
-                return patchResponse(body, httpHeaders, paramStrings, paramInts, stdout);
+                return patchResponseBody(body, httpHeaders, paramStrings, paramInts, currentMessage);
             }
-
-            String[] as=new String[256];
-            ByteArrayInputStream bis=new ByteArrayInputStream(body);
-            DataInputStream dis=new DataInputStream(bis);
-            int m_id=0;
-            ByteArrayOutputStream baos=new ByteArrayOutputStream();
-            DataOutputStream dos=new DataOutputStream(baos);
-            Message m;
-            // The Forms string table (the shared `as` array on the read side)
-            // accumulates across EVERY message in the stream: repeated strings
-            // are sent as 1-byte back-references into it. The write side keeps
-            // its mirror of that table inside a single FormsDispatcher, so the
-            // dispatcher must also live for the whole stream. A fresh
-            // dispatcher per message resets the table and desynchronises
-            // multi-message streams (i.e. responses), yielding a corrupt stream
-            // that crashes the client and no longer re-deserialises. Requests
-            // only got away with the old per-message dispatcher because they
-            // are short.
-            FormsDispatcher dispatcher=new FormsDispatcher();
-            boolean serialisationFailed=false;
-            try{
-                debug("[*] Enter stream parser");
-                while((m=Message.readDetails(dis,as))!=null){
-                    debug("[*] Message start, ID: "+m_id+ " size: "+m.size());
-                    // Apply edits recursively so strings/ints nested inside other
-                    // Message objects are updated too, not just top-level ones.
-                    // Only genuinely changed values are re-set (see applyEdits).
-                    applyEdits(m, "_"+m_id, paramStrings, paramInts, paramBools, stdout);
-                    int resolved=resolveIndexTags(m);
-                    if (resolved>0){
-                        debug("[*] Resolved "+resolved+" IndexTag reference(s) before writing message "+m_id);
-                    }
-                    m.writeDetails(dispatcher, dos);
-                    m_id++;
-                }
-
-            }catch(EOFException eofe){
-                debug("\nReached EOF in getMessage()");
-            }catch(IOException e){
-                stdout.println("Message IOException");
-                e.printStackTrace(stdout);
-            }catch(RuntimeException re){
-                // e.g. an IndexTag that could not be resolved. Rather than hand
-                // Burp a truncated/corrupt body (which crashes the client and
-                // breaks history rendering), forward the original message
-                // untouched and make the failure visible.
-                stdout.println("[!] Re-serialisation failed at message "+m_id+", forwarding original message unchanged:");
-                re.printStackTrace(stdout);
-                serialisationFailed=true;
-            }
-            if (serialisationFailed){
-                return currentMessage;
-            }
-            try{
-                dos.writeByte(-16);
-                dos.writeByte(0x01);
-                return helpers.buildHttpMessage(httpHeaders, baos.toByteArray());
-            }catch(IOException e){
-                stdout.println("Message IOException - last bytes");
-                e.printStackTrace(stdout);
-                return null;
-            }
-        }
-
-        // Apply string edits to a response by patching the raw body in place
-        // instead of re-serialising it (see getMessage() for why re-serialising
-        // responses is impossible). We re-parse the original body only to learn
-        // each editable property's original value, then find that literal's
-        // writeUTF bytes in the body and swap in the new value's bytes. String
-        // references are index-based, so changing a literal's length keeps the
-        // rest of the stream valid.
-        private byte[] patchResponse(byte[] body, List<String> httpHeaders,
-                                     HashMap<String,String> paramStrings,
-                                     HashMap<String,Integer> paramInts, PrintWriter stdout)
-        {
-            HashMap<String,String> origStrings=new HashMap<String,String>();
-            HashMap<String,Integer> origInts=new HashMap<String,Integer>();
-            String[] as=new String[256];
-            try{
-                ByteArrayInputStream bis=new ByteArrayInputStream(body);
-                DataInputStream dis=new DataInputStream(bis);
-                Message m;
-                int m_id=0;
-                while((m=Message.readDetails(dis,as))!=null){
-                    collectStrings(m, "_"+m_id, origStrings, origInts, new HashMap<String,Boolean>()); // same recursive keys as the editable surface; booleans unused on the response path
-                    m_id++;
-                }
-            }catch(EOFException eofe){
-                // normal end of stream
-            }catch(Exception e){
-                stdout.println("[!] Failed to parse original response body for patching; forwarding unchanged:");
-                e.printStackTrace(stdout);
-                return currentMessage;
-            }
-
-            byte[] patched=body;
-            int changes=0;
-            for (String key: paramStrings.keySet()){
-                String newV=paramStrings.get(key);
-                String oldV=origStrings.get(key);
-                if (oldV==null || oldV.equals(newV)){
-                    continue; // unknown key or value untouched by the user
-                }
-                try{
-                    byte[] oldPat=utfBytes(oldV);
-                    byte[] newPat=utfBytes(newV);
-                    int idx=indexOf(patched, oldPat, 0);
-                    if (idx<0){
-                        stdout.println("[!] Could not locate literal bytes for "+key+" (\""+oldV+"\") in the response body; this edit was skipped.");
-                        stdout.println("[!] The value is probably stored with an encoding this patcher does not recognise. Body hex follows so the format can be analysed:");
-                        stdout.println(byteArrayToHex(patched));
-                        continue;
-                    }
-                    if (indexOf(patched, oldPat, idx+oldPat.length)>=0){
-                        stdout.println("[!] Literal for "+key+" (\""+oldV+"\") occurs more than once; patching first occurrence at offset "+idx+" only.");
-                    }
-                    byte[] nb=new byte[patched.length-oldPat.length+newPat.length];
-                    System.arraycopy(patched,0,nb,0,idx);
-                    System.arraycopy(newPat,0,nb,idx,newPat.length);
-                    System.arraycopy(patched,idx+oldPat.length,nb,idx+newPat.length,patched.length-(idx+oldPat.length));
-                    patched=nb;
-                    changes++;
-                    stdout.println("[+] Patched "+key+": \""+oldV+"\" -> \""+newV+"\" at body offset "+idx);
-                }catch(IOException ioe){
-                    stdout.println("[!] Failed to encode replacement for "+key+"; edit skipped.");
-                    ioe.printStackTrace(stdout);
-                }
-            }
-
-            int intEdits=0;
-            for (String key: paramInts.keySet()){
-                Integer newV=paramInts.get(key);
-                Integer oldV=origInts.get(key);
-                if (oldV!=null && !oldV.equals(newV)){
-                    intEdits++;
-                }
-            }
-            if (intEdits>0){
-                stdout.println("[*] Note: integer edits are not supported for responses (ambiguous to locate by value); "+intEdits+" changed int field(s) ignored.");
-            }
-
-            stdout.println("[*] Response patch complete: "+changes+" string(s) changed, new body length "+patched.length);
-            return helpers.buildHttpMessage(httpHeaders, patched);
+            return reserializeRequestBody(body, httpHeaders, paramStrings, paramInts, paramBools, currentMessage);
         }
 
         @Override
@@ -1691,23 +1682,33 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
     class OracleFormsTreeTabFactory implements IMessageEditorTabFactory {
         @Override
         public IMessageEditorTab createNewInstance(IMessageEditorController controller, boolean editable){
-            return new OracleFormsTreeTab();
+            return new OracleFormsTreeTab(editable);
         }
     }
 
-    // A read-only message-editor tab that renders the deserialized Forms message
-    // as a JTree (messages -> properties -> nested messages), with a filter box
-    // and a right-click "show raw hex". Recon aid for spotting object/menu IDs
-    // and hidden items. Never modifies the message.
+    // A message-editor tab that renders the deserialized Forms message as a JTree
+    // (messages -> properties -> nested messages), with a filter box and a
+    // right-click "show raw hex". On editable surfaces, leaf values can be edited
+    // (double-click, or select + right-click "Edit value..."); edits forward
+    // through the same serialization as the param tab (re-serialise requests,
+    // byte-patch response strings).
     class OracleFormsTreeTab implements IMessageEditorTab {
+        private final boolean editable;
         private final javax.swing.JPanel component;
         private final javax.swing.JTree tree;
         private final javax.swing.JTextField filterField;
         private byte[] currentMessage;
         private byte[] currentBody;
         private boolean currentIsRequest=true;
+        // Accumulated edits (same key scheme as collectStrings/applyEdits) and a
+        // dirty flag; cleared on setMessage.
+        private final HashMap<String,String> paramStrings=new HashMap<String,String>();
+        private final HashMap<String,Integer> paramInts=new HashMap<String,Integer>();
+        private final HashMap<String,Boolean> paramBools=new HashMap<String,Boolean>();
+        private boolean modified=false;
 
-        OracleFormsTreeTab(){
+        OracleFormsTreeTab(boolean editable){
+            this.editable=editable;
             component=new javax.swing.JPanel(new java.awt.BorderLayout());
 
             filterField=new javax.swing.JTextField();
@@ -1749,7 +1750,25 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                             "Raw Forms body hex", javax.swing.JOptionPane.PLAIN_MESSAGE);
                 }
             });
+            javax.swing.JMenuItem editItem=new javax.swing.JMenuItem("Edit value...");
+            menu.add(editItem);
+            editItem.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){ editSelectedLeaf(); }
+            });
             tree.setComponentPopupMenu(menu);
+
+            // Double-click an editable leaf to edit it in place.
+            tree.addMouseListener(new java.awt.event.MouseAdapter(){
+                public void mousePressed(java.awt.event.MouseEvent e){
+                    if (e.getClickCount()==2){
+                        javax.swing.tree.TreePath p=tree.getPathForLocation(e.getX(), e.getY());
+                        if (p!=null){
+                            tree.setSelectionPath(p);
+                            editSelectedLeaf();
+                        }
+                    }
+                }
+            });
 
             callbacks.customizeUiComponent(component);
         }
@@ -1761,16 +1780,30 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         @Override
         public boolean isEnabled(byte[] content, boolean isRequest){ return true; }
         @Override
-        public boolean isModified(){ return false; }
+        public boolean isModified(){ return modified; }
         @Override
         public byte[] getSelectedData(){ return null; }
         @Override
-        public byte[] getMessage(){ return currentMessage; } // read-only
+        public byte[] getMessage(){
+            if (!editable || !modified || currentMessage==null){
+                return currentMessage;
+            }
+            List<String> httpHeaders=currentIsRequest
+                ? helpers.analyzeRequest(currentMessage).getHeaders()
+                : helpers.analyzeResponse(currentMessage).getHeaders();
+            // currentBody is the original (unedited) body captured in setMessage().
+            return currentIsRequest
+                ? reserializeRequestBody(currentBody, httpHeaders, paramStrings, paramInts, paramBools, currentMessage)
+                : patchResponseBody(currentBody, httpHeaders, paramStrings, paramInts, currentMessage);
+        }
 
         @Override
         public void setMessage(byte[] content, boolean isRequest){
             currentMessage=content;
             currentIsRequest=isRequest;
+            // A new message display starts with a clean edit set.
+            paramStrings.clear(); paramInts.clear(); paramBools.clear();
+            modified=false;
             if (content==null){
                 currentBody=null;
                 tree.setModel(new javax.swing.tree.DefaultTreeModel(new javax.swing.tree.DefaultMutableTreeNode("No message")));
@@ -1797,7 +1830,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     Message m;
                     int idx=0;
                     while((m=Message.readDetails(dis,as))!=null){
-                        root.add(buildMessageNode(m, "Message "+idx+" (size "+m.size()+")"));
+                        root.add(buildMessageNode(m, "Message "+idx+" (size "+m.size()+")", "_"+idx));
                         idx++;
                     }
                 }catch(EOFException eofe){
@@ -1816,23 +1849,116 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
             }
         }
 
-        private javax.swing.tree.DefaultMutableTreeNode buildMessageNode(Message m, String label){
+        private javax.swing.tree.DefaultMutableTreeNode buildMessageNode(Message m, String label, String path){
             javax.swing.tree.DefaultMutableTreeNode node=new javax.swing.tree.DefaultMutableTreeNode(label);
             for (int i=0;i<m.size();i++){
                 Object v=m.getValueAt(i);
                 int t=m.getPropertyTypeAt(i);
                 Object propId=m.getPropertyAt(i);
                 if (v instanceof Message){
-                    node.add(buildMessageNode((Message)v, "Property "+i+" [id="+propId+"] (nested message)"));
+                    node.add(buildMessageNode((Message)v, "Property "+i+" [id="+propId+"] (nested message)", path+"_"+i));
                 }else{
                     String tlabel=(t==1?"String":(t==3?"Integer":(v instanceof Boolean?"Boolean":"type"+t)));
-                    String prefix=(t==3?"[int] ":"");
-                    String val=(v==null?"null":v.toString());
-                    node.add(new javax.swing.tree.DefaultMutableTreeNode(
-                        prefix+"Property "+i+" [id="+propId+"] "+tlabel+": "+val));
+                    // Editable leaves: String (type 1), Integer (type 3), Boolean;
+                    // keyed like collectStrings so the shared write-back finds them.
+                    String keyPrefix=(t==1?"string":(t==3?"int":(v instanceof Boolean?"bool":null)));
+                    if (keyPrefix!=null){
+                        String key=keyPrefix+path+"_"+i;
+                        String labelPrefix=(t==3?"[int] ":"")+"Property "+i+" [id="+propId+"] "+tlabel+": ";
+                        EditableTreeLeaf leaf=new EditableTreeLeaf(key, labelPrefix, editedValueFor(key, v));
+                        leaf.edited=paramStrings.containsKey(key)||paramInts.containsKey(key)||paramBools.containsKey(key);
+                        node.add(leaf);
+                    }else{
+                        String val=(v==null?"null":v.toString());
+                        node.add(new javax.swing.tree.DefaultMutableTreeNode(
+                            "Property "+i+" [id="+propId+"] "+tlabel+": "+val));
+                    }
                 }
             }
             return node;
+        }
+
+        // The value to display for a leaf: the pending edit if any, else the
+        // original parsed value. Keeps edits visible across filter rebuilds.
+        private Object editedValueFor(String key, Object orig){
+            if (paramStrings.containsKey(key)) return paramStrings.get(key);
+            if (paramInts.containsKey(key)) return paramInts.get(key);
+            if (paramBools.containsKey(key)) return paramBools.get(key);
+            return orig;
+        }
+
+        // Edit the selected editable leaf via a type-appropriate dialog and record
+        // the change in the edit maps. Responses only byte-patch strings, so int/
+        // bool leaves are not editable there.
+        private void editSelectedLeaf(){
+            if (!editable){
+                return;
+            }
+            Object sel=tree.getLastSelectedPathComponent();
+            if (!(sel instanceof EditableTreeLeaf)){
+                return;
+            }
+            EditableTreeLeaf leaf=(EditableTreeLeaf)sel;
+            boolean isInt=leaf.key.startsWith("int");
+            boolean isBool=leaf.key.startsWith("bool");
+            if (!currentIsRequest && !leaf.key.startsWith("string")){
+                javax.swing.JOptionPane.showMessageDialog(component,
+                    "Only String values are editable on responses (integers/booleans can't be byte-patched).",
+                    "Not editable", javax.swing.JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            if (isBool){
+                int r=javax.swing.JOptionPane.showConfirmDialog(component,
+                    "Set boolean value to TRUE?  (No = false)", "Edit boolean",
+                    javax.swing.JOptionPane.YES_NO_CANCEL_OPTION);
+                if (r!=javax.swing.JOptionPane.YES_OPTION && r!=javax.swing.JOptionPane.NO_OPTION){
+                    return;
+                }
+                Boolean nv=(r==javax.swing.JOptionPane.YES_OPTION);
+                paramBools.put(leaf.key, nv);
+                leaf.value=nv;
+            }else{
+                String cur=(leaf.value==null?"":leaf.value.toString());
+                String input=(String)javax.swing.JOptionPane.showInputDialog(component,
+                    "New value for "+leaf.key+":", "Edit value",
+                    javax.swing.JOptionPane.PLAIN_MESSAGE, null, null, cur);
+                if (input==null){
+                    return; // cancelled
+                }
+                if (isInt){
+                    try{
+                        Integer nv=Integer.valueOf(input.trim());
+                        paramInts.put(leaf.key, nv);
+                        leaf.value=nv;
+                    }catch(NumberFormatException nfe){
+                        javax.swing.JOptionPane.showMessageDialog(component,
+                            "\""+input+"\" is not a whole number.", "Invalid integer",
+                            javax.swing.JOptionPane.ERROR_MESSAGE);
+                        return;
+                    }
+                }else{
+                    paramStrings.put(leaf.key, input);
+                    leaf.value=input;
+                }
+            }
+            leaf.edited=true;
+            modified=true;
+            ((javax.swing.tree.DefaultTreeModel)tree.getModel()).nodeChanged(leaf);
+        }
+
+        // Tree leaf carrying the edit key + label so its value can be edited in
+        // place. toString() renders "<label prefix><value>[ (edited)]".
+        class EditableTreeLeaf extends javax.swing.tree.DefaultMutableTreeNode {
+            final String key;
+            final String labelPrefix;
+            Object value;
+            boolean edited=false;
+            EditableTreeLeaf(String key, String labelPrefix, Object value){
+                this.key=key; this.labelPrefix=labelPrefix; this.value=value;
+            }
+            @Override public String toString(){
+                return labelPrefix+(value==null?"null":value.toString())+(edited?"   (edited)":"");
+            }
         }
 
         // Prune the tree to nodes whose label (or a descendant's) contains the
