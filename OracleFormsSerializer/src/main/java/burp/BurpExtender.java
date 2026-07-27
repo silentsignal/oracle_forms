@@ -109,6 +109,9 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         searchTab=new OracleFormsSearchTab();
         callbacks.addSuiteTab(searchTab);
         callbacks.registerContextMenuFactory(this);
+
+        // Value-frequency stats over the same decrypted corpus (read-only recon).
+        callbacks.addSuiteTab(new OracleFormsStatsTab());
     }
     
     public boolean gotKey(){
@@ -2055,6 +2058,20 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
         }
     }
 
+    // Aggregate frequency stats for one distinct Forms value across the scanned
+    // corpus. `items` collects the distinct HTTP-message indices the value
+    // appears in during the scan (its size is itemCount); it drives the count,
+    // it isn't shown directly.
+    static class ValueStat {
+        final String value;
+        int total;      // total occurrences across all leaves and items
+        int reqCount;   // occurrences in request bodies
+        int respCount;  // occurrences in response bodies
+        final Set<Integer> items=new java.util.HashSet<Integer>();
+        ValueStat(String value){ this.value=value; }
+        int itemCount(){ return items.size(); }
+    }
+
     // Serialized Forms body of a request, or null if this isn't a Forms POST or
     // is a handshake / NULLPOST / empty body (mirrors processHttpMessage()).
     private byte[] formsRequestBody(byte[] request, IRequestInfo rInfo){
@@ -2240,6 +2257,119 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                 hits.add(new SearchHit(item, index, url, isRequest, e.getKey(), v));
             }
         }
+    }
+
+    // Aggregate leaf values across the given items into a frequency map — a
+    // tally counterpart to searchForms (no query; every value is counted).
+    // `tallyStrings`/`tallyInts` select which value types are counted.
+    // `progress`/`cancelled` behave exactly as in searchForms.
+    java.util.Map<String,ValueStat> tallyForms(IHttpRequestResponse[] items,
+            boolean useReq, boolean useResp, boolean tallyStrings, boolean tallyInts,
+            java.util.function.IntConsumer progress, java.util.concurrent.atomic.AtomicBoolean cancelled){
+        java.util.Map<String,ValueStat> stats=new HashMap<String,ValueStat>();
+        if (items==null){
+            return stats;
+        }
+        for (int i=0;i<items.length;i++){
+            if (cancelled!=null && cancelled.get()){
+                break;
+            }
+            if (progress!=null){
+                progress.accept(i);
+            }
+            IHttpRequestResponse item=items[i];
+            if (item==null){
+                continue;
+            }
+            byte[] request=item.getRequest();
+            if (request==null){
+                continue;
+            }
+            // Same cheap pre-parse gate as searchForms: skip non-Forms items.
+            if (indexOf(request, LSERVLET_BYTES, 0)<0){
+                continue;
+            }
+            IRequestInfo rInfo;
+            try{
+                rInfo=helpers.analyzeRequest(item);
+            }catch(RuntimeException e){
+                continue;
+            }
+            String url=(rInfo.getUrl()==null)?"":rInfo.getUrl().toString();
+            if (useReq){
+                byte[] body=formsRequestBody(request, rInfo);
+                if (body!=null){
+                    tallyBody(stats, body, i, true, tallyStrings, tallyInts);
+                }
+            }
+            if (useResp && url.indexOf("/lservlet")!=-1){
+                byte[] body=formsResponseBody(item.getResponse());
+                if (body!=null){
+                    tallyBody(stats, body, i, false, tallyStrings, tallyInts);
+                }
+            }
+        }
+        if (progress!=null){
+            progress.accept(items.length);
+        }
+        return stats;
+    }
+
+    // Fold one Forms body's selected leaves into the stats map, keeping String
+    // and Integer leaves separate (via collectStrings) so each type can be
+    // tallied independently. A value repeated at several paths in one body
+    // counts as several occurrences but contributes a single distinct item.
+    private void tallyBody(java.util.Map<String,ValueStat> stats, byte[] body, int itemIndex,
+            boolean isRequest, boolean tallyStrings, boolean tallyInts){
+        java.util.LinkedHashMap<String,String> strings=new java.util.LinkedHashMap<String,String>();
+        java.util.LinkedHashMap<String,Integer> ints=new java.util.LinkedHashMap<String,Integer>();
+        java.util.LinkedHashMap<String,Boolean> bools=new java.util.LinkedHashMap<String,Boolean>();
+        String[] localAs=new String[256];
+        try{
+            ByteArrayInputStream bis=new ByteArrayInputStream(body);
+            DataInputStream dis=new DataInputStream(bis);
+            Message m;
+            int m_id=0;
+            while((m=Message.readDetails(dis,localAs))!=null){
+                collectStrings(m, "_"+m_id, strings, ints, bools);
+                m_id++;
+            }
+        }catch(EOFException eofe){
+            // normal end of stream
+        }catch(Exception e){
+            return; // unparseable — skip
+        }
+        if (tallyStrings){
+            for (String v: strings.values()){
+                foldValue(stats, v, itemIndex, isRequest);
+            }
+        }
+        if (tallyInts){
+            for (Integer v: ints.values()){
+                if (v!=null){
+                    foldValue(stats, v.toString(), itemIndex, isRequest);
+                }
+            }
+        }
+    }
+
+    // Record one occurrence of `value` in the stats map.
+    private void foldValue(java.util.Map<String,ValueStat> stats, String value, int itemIndex, boolean isRequest){
+        if (value==null){
+            return;
+        }
+        ValueStat st=stats.get(value);
+        if (st==null){
+            st=new ValueStat(value);
+            stats.put(value, st);
+        }
+        st.total++;
+        if (isRequest){
+            st.reqCount++;
+        }else{
+            st.respCount++;
+        }
+        st.items.add(Integer.valueOf(itemIndex));
     }
 
     // Right-click entry that pre-fills and runs the search tab from selected text.
@@ -2587,6 +2717,248 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IS
                     case 2: return h.isRequest?"Req":"Resp";
                     case 3: return h.location;
                     case 4: return h.value.length()>200 ? h.value.substring(0,200)+"…" : h.value;
+                }
+                return null;
+            }
+        }
+    }
+
+    // Suite tab: aggregate value-frequency stats over decrypted Forms traffic —
+    // a tally counterpart to OracleFormsSearchTab. Scans the same corpus (proxy
+    // history / site map), read-only recon; double-click a value to jump to the
+    // Forms search for it.
+    class OracleFormsStatsTab implements ITab {
+        private final javax.swing.JPanel panel;
+        private final javax.swing.JCheckBox strBox=new javax.swing.JCheckBox("strings", true);
+        private final javax.swing.JCheckBox intBox=new javax.swing.JCheckBox("integers", true);
+        private final javax.swing.JCheckBox reqBox=new javax.swing.JCheckBox("requests", true);
+        private final javax.swing.JCheckBox respBox=new javax.swing.JCheckBox("responses", true);
+        private final javax.swing.JCheckBox historyBox=new javax.swing.JCheckBox("proxy history", true);
+        private final javax.swing.JCheckBox sitemapBox=new javax.swing.JCheckBox("site map", false);
+        private final javax.swing.JTextField filterField=new javax.swing.JTextField(20);
+        private final javax.swing.JButton refreshBtn=new javax.swing.JButton("Refresh");
+        private final javax.swing.JButton cancelBtn=new javax.swing.JButton("Cancel");
+        private final javax.swing.JProgressBar progress=new javax.swing.JProgressBar();
+        private final javax.swing.JLabel status=new javax.swing.JLabel(" ");
+        private final java.util.List<ValueStat> results=new ArrayList<ValueStat>();
+        private final StatsTableModel model=new StatsTableModel();
+        private final javax.swing.JTable table=new javax.swing.JTable(model);
+        private final javax.swing.table.TableRowSorter<StatsTableModel> sorter=
+                new javax.swing.table.TableRowSorter<StatsTableModel>(model);
+        // Cancellation flag for the in-flight scan (polled by tallyForms).
+        private java.util.concurrent.atomic.AtomicBoolean cancelFlag=new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        OracleFormsStatsTab(){
+            panel=new javax.swing.JPanel(new java.awt.BorderLayout());
+
+            javax.swing.JPanel row1=new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 4));
+            row1.add(new javax.swing.JLabel("Tally:"));
+            row1.add(strBox);
+            row1.add(intBox);
+            row1.add(new javax.swing.JLabel("    In:"));
+            row1.add(reqBox);
+            row1.add(respBox);
+            row1.add(new javax.swing.JLabel("    Source:"));
+            row1.add(historyBox);
+            row1.add(sitemapBox);
+            row1.add(refreshBtn);
+            row1.add(cancelBtn);
+            cancelBtn.setEnabled(false);
+            progress.setStringPainted(false);
+            progress.setPreferredSize(new java.awt.Dimension(160, 16));
+            progress.setVisible(false);
+            row1.add(progress);
+
+            javax.swing.JPanel row2=new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 0));
+            row2.add(new javax.swing.JLabel("Filter:"));
+            row2.add(filterField);
+            javax.swing.JPanel row3=new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 0));
+            row3.add(status);
+
+            javax.swing.JPanel north=new javax.swing.JPanel();
+            north.setLayout(new javax.swing.BoxLayout(north, javax.swing.BoxLayout.Y_AXIS));
+            row1.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+            row2.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+            row3.setAlignmentX(java.awt.Component.LEFT_ALIGNMENT);
+            north.add(row1);
+            north.add(row2);
+            north.add(row3);
+            north.setBorder(javax.swing.BorderFactory.createTitledBorder(
+                    "Oracle Forms value stats (frequency of decrypted String/Integer values)"));
+            panel.add(north, java.awt.BorderLayout.NORTH);
+
+            table.setFillsViewportHeight(true);
+            table.setAutoResizeMode(javax.swing.JTable.AUTO_RESIZE_LAST_COLUMN);
+            table.setRowSorter(sorter);
+            // Default view: most-frequent value first.
+            sorter.setSortKeys(java.util.Collections.singletonList(
+                    new javax.swing.RowSorter.SortKey(1, javax.swing.SortOrder.DESCENDING)));
+            panel.add(new javax.swing.JScrollPane(table), java.awt.BorderLayout.CENTER);
+
+            refreshBtn.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){ runTally(); }
+            });
+            cancelBtn.addActionListener(new java.awt.event.ActionListener(){
+                public void actionPerformed(java.awt.event.ActionEvent e){
+                    cancelFlag.set(true);
+                    cancelBtn.setEnabled(false);
+                    status.setText("Cancelling…");
+                }
+            });
+            // Live substring filter on the value column (no re-scan).
+            filterField.getDocument().addDocumentListener(new javax.swing.event.DocumentListener(){
+                public void insertUpdate(javax.swing.event.DocumentEvent e){ applyFilter(); }
+                public void removeUpdate(javax.swing.event.DocumentEvent e){ applyFilter(); }
+                public void changedUpdate(javax.swing.event.DocumentEvent e){ applyFilter(); }
+            });
+            // Double-click a value → run the Forms search for it.
+            table.addMouseListener(new java.awt.event.MouseAdapter(){
+                public void mouseClicked(java.awt.event.MouseEvent e){
+                    if (e.getClickCount()==2){
+                        ValueStat st=selectedStat();
+                        if (st!=null && searchTab!=null){
+                            searchTab.searchFor(st.value);
+                        }
+                    }
+                }
+            });
+
+            callbacks.customizeUiComponent(panel);
+        }
+
+        @Override public String getTabCaption(){ return "Oracle Forms Stats"; }
+        @Override public Component getUiComponent(){ return panel; }
+
+        private ValueStat selectedStat(){
+            int row=table.getSelectedRow();
+            if (row<0){
+                return null;
+            }
+            int mrow=table.convertRowIndexToModel(row);
+            if (mrow<0 || mrow>=results.size()){
+                return null;
+            }
+            return results.get(mrow);
+        }
+
+        // Filter table rows by a case-insensitive substring of the value column.
+        private void applyFilter(){
+            String f=filterField.getText();
+            if (f==null || f.isEmpty()){
+                sorter.setRowFilter(null);
+                return;
+            }
+            try{
+                sorter.setRowFilter(javax.swing.RowFilter.regexFilter("(?i)"+Pattern.quote(f), 0));
+            }catch(RuntimeException ex){
+                sorter.setRowFilter(null);
+            }
+        }
+
+        private void runTally(){
+            final boolean tallyStrings=strBox.isSelected();
+            final boolean tallyInts=intBox.isSelected();
+            final boolean useReq=reqBox.isSelected();
+            final boolean useResp=respBox.isSelected();
+            final boolean useHistory=historyBox.isSelected();
+            final boolean useSitemap=sitemapBox.isSelected();
+            if (!tallyStrings && !tallyInts){
+                status.setText("Tick strings and/or integers.");
+                return;
+            }
+            if (!useReq && !useResp){
+                status.setText("Tick requests and/or responses.");
+                return;
+            }
+            if (!useHistory && !useSitemap){
+                status.setText("Pick a source (proxy history and/or site map).");
+                return;
+            }
+            cancelFlag=new java.util.concurrent.atomic.AtomicBoolean(false);
+            final java.util.concurrent.atomic.AtomicBoolean cancel=cancelFlag;
+            refreshBtn.setEnabled(false);
+            cancelBtn.setEnabled(true);
+            progress.setVisible(true);
+            progress.setIndeterminate(true);
+            status.setText("Scanning…");
+            new javax.swing.SwingWorker<java.util.Map<String,ValueStat>,Integer>(){
+                private int total=0;
+                @Override protected java.util.Map<String,ValueStat> doInBackground(){
+                    java.util.LinkedHashSet<IHttpRequestResponse> items=new java.util.LinkedHashSet<IHttpRequestResponse>();
+                    if (useHistory){
+                        IHttpRequestResponse[] h=callbacks.getProxyHistory();
+                        if (h!=null){
+                            for (IHttpRequestResponse it: h){ items.add(it); }
+                        }
+                    }
+                    if (useSitemap){
+                        IHttpRequestResponse[] s=callbacks.getSiteMap(null);
+                        if (s!=null){
+                            for (IHttpRequestResponse it: s){ items.add(it); }
+                        }
+                    }
+                    total=items.size();
+                    // Throttle progress so a large history doesn't flood the EDT.
+                    java.util.function.IntConsumer prog=new java.util.function.IntConsumer(){
+                        public void accept(int c){
+                            if (c==total || (c & 63)==0){
+                                publish(c);
+                            }
+                        }
+                    };
+                    return tallyForms(items.toArray(new IHttpRequestResponse[0]),
+                            useReq, useResp, tallyStrings, tallyInts, prog, cancel);
+                }
+                @Override protected void process(java.util.List<Integer> chunks){
+                    int scanned=chunks.get(chunks.size()-1);
+                    if (total>0){
+                        progress.setIndeterminate(false);
+                        progress.setMaximum(total);
+                        progress.setValue(Math.min(scanned, total));
+                    }
+                    status.setText("scanned "+scanned+" / "+total+"…");
+                }
+                @Override protected void done(){
+                    try{
+                        java.util.Map<String,ValueStat> stats=get();
+                        results.clear();
+                        results.addAll(stats.values());
+                        model.fireTableDataChanged();
+                        long instances=0;
+                        for (ValueStat st: results){ instances+=st.total; }
+                        String prefix=cancel.get()?"Cancelled — ":"";
+                        status.setText(prefix+total+" item(s) scanned, "+results.size()
+                                +" distinct value(s), "+instances+" occurrence(s).");
+                    }catch(Exception ex){
+                        status.setText("Scan failed: "+ex);
+                    }finally{
+                        refreshBtn.setEnabled(true);
+                        cancelBtn.setEnabled(false);
+                        progress.setIndeterminate(false);
+                        progress.setVisible(false);
+                    }
+                }
+            }.execute();
+        }
+
+        class StatsTableModel extends javax.swing.table.AbstractTableModel {
+            private final String[] cols={"Value","Total","Req","Resp","Items"};
+            @Override public int getRowCount(){ return results.size(); }
+            @Override public int getColumnCount(){ return cols.length; }
+            @Override public String getColumnName(int c){ return cols[c]; }
+            @Override public boolean isCellEditable(int r, int c){ return false; }
+            @Override public Class<?> getColumnClass(int c){ return c==0 ? String.class : Integer.class; }
+            @Override public Object getValueAt(int r, int c){
+                if (r<0 || r>=results.size()){
+                    return null;
+                }
+                ValueStat st=results.get(r);
+                switch(c){
+                    case 0: return st.value.length()>200 ? st.value.substring(0,200)+"…" : st.value;
+                    case 1: return Integer.valueOf(st.total);
+                    case 2: return Integer.valueOf(st.reqCount);
+                    case 3: return Integer.valueOf(st.respCount);
+                    case 4: return Integer.valueOf(st.itemCount());
                 }
                 return null;
             }

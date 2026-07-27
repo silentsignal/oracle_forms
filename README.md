@@ -71,6 +71,12 @@ Forms message bodies are serialized binary, so Burp's own search can't see the p
 
 Searching is fast even on large histories: for a plain-text query a cheap raw-byte prefilter skips the expensive deserialization of any message that can't contain it, and the scan runs in the background with a progress bar and a Cancel button. (The prefilter is bypassed for regex, non-ASCII, and all-digit queries, so results are always complete.)
 
+### Value stats
+
+Where the search finds a single query, the **Oracle Forms Stats** suite tab gives the aggregate view: it tallies *every* decrypted value and how often it recurs. It scans the same corpus (proxy history and, optionally, the site map), deserializes each Forms body, and lists every distinct value with its **total occurrences**, a **request-vs-response split**, and the number of **distinct HTTP messages** it appears in — making it easy to tell a static UI label from a value that recurs across many requests (session tokens, object IDs, repeated field contents).
+
+Pick which value types to count (**strings**, **integers**, or both). The table is sortable (most-frequent first by default) with a live substring filter, and double-clicking a value jumps straight to the Forms-aware search for it. Like the search, it uses the raw-byte `/lservlet` prefilter and runs off the UI thread with a progress bar and a Cancel button.
+
 ### Building the Extension
 
 Download the `frmall.jar` archive from your target and copy it under `OracleFormsSerializer/lib`. Inside `OracleFormsSerializer/` start an Gradle build:
